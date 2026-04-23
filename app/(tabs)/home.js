@@ -1,9 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator, Animated, Modal, ScrollView,
   StyleSheet, Text, TouchableOpacity, View,
 } from "react-native";
-import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from "react-native-maps";
+import MapView, { Marker, Polyline, PROVIDER_GOOGLE, AnimatedRegion } from "react-native-maps";
 import * as Location from "expo-location";
 import * as KeepAwake from "expo-keep-awake";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -19,165 +19,291 @@ import {
   useAcceptTripMutation,
   useSendEmergencyMutation,
   useEndTripMutation,
+  useGetActiveTripQuery,
 } from "../../store/driverApi";
 import { getSocket } from "../../lib/socket";
 import { THEME } from "../../constants/theme";
 import { STRINGS } from "../../constants/i18n";
- 
+import { format, parseISO, subMinutes, isBefore } from "date-fns";
+import { TRUCK_TYPE } from "../../constants/constants";
+import { haversine, mapStop } from "../../lib/tripHelpers";
+import { RefreshControl } from "react-native-gesture-handler";
+
 // ── Helpers ───────────────────────────────────────────────────────────────
-function haversine(a, b) {
-  const R = 6371000, toRad = (d) => (d * Math.PI) / 180;
-  const dLat = toRad(b.lat - a.lat), dLng = toRad(b.lng - a.lng);
-  const x =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
-}
- 
-function interpolateRoute(coords, fraction) {
-  if (!coords?.length) return null;
-  if (fraction <= 0) return coords[0];
-  if (fraction >= 1) return coords[coords.length - 1];
-  const maxIdx = coords.length - 1;
-  const idx = Math.min(Math.floor(fraction * maxIdx), maxIdx - 1);
-  const t = fraction * maxIdx - idx;
-  return {
-    latitude:
-      coords[idx].latitude + t * (coords[idx + 1].latitude - coords[idx].latitude),
-    longitude:
-      coords[idx].longitude + t * (coords[idx + 1].longitude - coords[idx].longitude),
-  };
-}
- 
+// function haversine(a, b) {
+//   const R = 6371000, toRad = (d) => (d * Math.PI) / 180;
+//   const dLat = toRad(b.lat - a.lat), dLng = toRad(b.lng - a.lng);
+//   const x =
+//     Math.sin(dLat / 2) ** 2 +
+//     Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+//   return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+// }
+
+// function interpolateRoute(coords, fraction) {
+//   if (!coords?.length) return null;
+//   if (fraction <= 0) return coords[0];
+//   if (fraction >= 1) return coords[coords.length - 1];
+//   const maxIdx = coords.length - 1;
+//   const idx = Math.min(Math.floor(fraction * maxIdx), maxIdx - 1);
+//   const t = fraction * maxIdx - idx;
+//   return {
+//     latitude:
+//       coords[idx].latitude + t * (coords[idx + 1].latitude - coords[idx].latitude),
+//     longitude:
+//       coords[idx].longitude + t * (coords[idx + 1].longitude - coords[idx].longitude),
+//   };
+// }
+
 // Maps raw API stop → Redux stop shape
-function mapStop(st, i, total) {
-  return {
-    id:             st.stop_id ?? st.id,
-    order:          i + 1,
-    name:           st.store?.name ?? st.store_name ?? `Stop ${i + 1}`,
-    address:        st.store?.address ?? st.address ?? "",
-    latitude:       parseFloat(st.store?.latitude  ?? st.latitude  ?? 0),
-    longitude:      parseFloat(st.store?.longitude ?? st.longitude ?? 0),
-    etaTime:        st.eta
-      ? new Date(st.eta).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })
-      : "—",
-    status:         st.status === "confirmed" ? "completed" : st.status ?? "pending",
-    geofenceRadius: parseInt(st.store?.geofence_radius ?? 200),
-    milestonePct:   Math.round(((i + 1) / (total + 1)) * 100),
-  };
+// function mapStop(st, i, total) {
+//   return {
+//     id: st.stop_id ?? st.id,
+//     order: i + 1,
+//     name: st.store?.name ?? st.store_name ?? `Stop ${i + 1}`,
+//     address: st.store?.address ?? st.address ?? "",
+//     latitude: parseFloat(st.store?.latitude ?? st.latitude ?? 0),
+//     longitude: parseFloat(st.store?.longitude ?? st.longitude ?? 0),
+//     etaTime: st.eta
+//       ? new Date(st.eta).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })
+//       : "—",
+//     status: st.status === "confirmed" ? "completed" : st.status ?? "pending",
+//     geofenceRadius: parseInt(st.store?.geofence_radius ?? 200),
+//     milestonePct: Math.round(((i + 1) / (total + 1)) * 100),
+//   };
+// }
+
+
+// Decode Google-encoded polyline (Mapbox returns this for "polyline" format)
+// ─────────────────────────────────────────────────────────────────────────
+function decodePolyline(encoded) {
+  const coords = [];
+  let index = 0, lat = 0, lng = 0;
+  while (index < encoded.length) {
+    let b, shift = 0, result = 0;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    lat += result & 1 ? ~(result >> 1) : result >> 1;
+    shift = 0; result = 0;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    lng += result & 1 ? ~(result >> 1) : result >> 1;
+    coords.push({ latitude: lat / 1e5, longitude: lng / 1e5 });
+  }
+  return coords;
 }
- 
+
+// Fetch a real driving route from Mapbox Directions API.
+// waypoints: [{ latitude, longitude }, ...]
+// Returns [{ latitude, longitude }, ...] ready for <Polyline>
+// ─────────────────────────────────────────────────────────────────────────
+async function fetchMapboxRoute(waypoints) {
+  if (!waypoints || waypoints.length < 2) return [];
+  try {
+    const coordStr = waypoints
+      .map((w) => `${w.longitude},${w.latitude}`)
+      .join(";");
+    const url =
+      `https://api.mapbox.com/directions/v5/mapbox/driving/${coordStr}` +
+      `?geometries=polyline&overview=full&access_token=${process.env.EXPO_PUBLIC_MAPBOX_API}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!data.routes?.[0]?.geometry) return [];
+    return decodePolyline(data.routes[0].geometry);
+  } catch (e) {
+    console.error("[Mapbox] Route error:", e);
+    return [];
+  }
+}
+
 // ── Animated truck marker ─────────────────────────────────────────────────
-function AnimatedTruck({ position }) {
-  const scale = useRef(new Animated.Value(1)).current;
+function TruckMarker({ animRegion }) {
+  const pulse = useRef(new Animated.Value(1)).current;
   useEffect(() => {
-    Animated.loop(
+    const loop = Animated.loop(
       Animated.sequence([
-        Animated.timing(scale, { toValue: 1.1, duration: 1100, useNativeDriver: true }),
-        Animated.timing(scale, { toValue: 1,   duration: 1100, useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 1.18, duration: 900, useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 1,    duration: 900, useNativeDriver: true }),
       ])
-    ).start();
+    );
+    loop.start();
+    return () => loop.stop();
   }, []);
+ 
   return (
-    <Marker coordinate={position} anchor={{ x: 0.5, y: 0.5 }}>
-      <Animated.View style={[mS.truckMarker, { transform: [{ scale }] }]}>
+    <Marker.Animated
+      coordinate={animRegion}
+      anchor={{ x: 0.5, y: 0.5 }}
+      tracksViewChanges={false}
+      flat
+      zIndex={10}
+    >
+      <Animated.View style={[mS.truckMarker, { transform: [{ scale: pulse }] }]}>
         <Text style={{ fontSize: 22 }}>🚛</Text>
       </Animated.View>
-    </Marker>
+    </Marker.Animated>
   );
 }
- 
+
 // ── Past trips mini-card ──────────────────────────────────────────────────
 function PastTripCard({ trip }) {
   const done = (trip.stops ?? []).filter((s) => s.status === "confirmed").length;
   return (
     <View style={ptS.card}>
       <View style={ptS.cardLeft}>
-        <Text style={ptS.tripCode}>{trip.id.slice(0, 8).toUpperCase()}</Text>
-        <Text style={ptS.tripDate}>
-          {trip.departed_at
-            ? new Date(trip.departed_at).toLocaleDateString("en-IN", { day: "2-digit", month: "short" })
-            : "—"}
-        </Text>
+        <Text style={ptS.tripCode}>{trip.tracking_code.toUpperCase()}</Text>
+
+        <Text style={ptS.tripDate}>{format(trip.departed_at, "MMM d")}</Text>
+        <Text style={ptS.tripDate}>{format(trip.departed_at, "'at' h:mm a")}</Text>
+
+
       </View>
       <View style={ptS.cardMid}>
         <Text style={ptS.stops}>{done}/{trip.stops?.length ?? 0} stops</Text>
-        <Text style={ptS.addr} numberOfLines={1}>
+        <Text style={ptS.addr}>
           {trip.stops?.[0]?.store?.address ?? "—"}
         </Text>
       </View>
-      <View style={[ptS.badge, { backgroundColor: trip.status === "in_transit" ? "#dbeafe" : "#f1f5f9" }]}>
-        <Text style={[ptS.badgeTxt, { color: trip.status === "in_transit" ? THEME.blue600 : THEME.slate500 }]}>
-          {trip.status}
-        </Text>
+      <View style={{ gap: 6 }}>
+        <Text style={{ color: THEME.slate700, fontSize: 12, fontWeight: "600" }}>{trip.truck_no}</Text>
+        <View style={[ptS.badge, { backgroundColor: trip.status === "in_transit" ? "#dbeafe" : "#f1f5f9" }]}>
+          <Text style={[ptS.badgeTxt, { color: trip.status === "in_transit" ? THEME.blue600 : THEME.slate500 }]}>
+            {trip.status}
+          </Text>
+        </View>
       </View>
     </View>
   );
 }
- 
+
 // ══════════════════════════════════════════════════════════════════════════
 // MAIN HOME SCREEN
 // ══════════════════════════════════════════════════════════════════════════
 export default function HomeScreen() {
-  const insets   = useSafeAreaInsets();
+  const insets = useSafeAreaInsets();
   const dispatch = useDispatch();
-  const driver   = useSelector((s) => s.auth.driver);
-  const token    = useSelector((s) => s.auth.token);
-  const lang     = useSelector((s) => s.auth.lang ?? "en");
+  const driver = useSelector((s) => s.auth.driver);
+  const token = useSelector((s) => s.auth.token);
+  const lang = useSelector((s) => s.auth.lang ?? "en");
   const { stops, nearStopId } = useSelector((s) => s.trip);
   const s = STRINGS[lang];
- 
+
   // ── RTK Query ─────────────────────────────────────────────────────────
   //  const driverId = driver?.id ?? "43f8fa9a-9985-48bc-84df-1a4428b747fc";
   const driverId = "43f8fa9a-9985-48bc-84df-1a4428b747fc"; // demo fallback
+
+  // ── RTK Query ────────────────────────────────────────────────────────
   const {
     data: tripsData,
     isLoading: tripsLoading,
-    refetch,
-  } = useGetAllTripsQuery(driverId, { pollingInterval: 30000 });
+    isFetching,
+    refetch: refetchAll,
+  } = useGetAllTripsQuery(driverId, {
+    pollingInterval: 30000,
+    // skip: !driverId,
+  });
 
-  console.log("tripData", tripsData);
-  
- 
-  const [acceptTrip,    { isLoading: accepting }]  = useAcceptTripMutation();
-  const [sendEmergency]                             = useSendEmergencyMutation();
-  const [endTrip]                                   = useEndTripMutation();
- 
+  const {
+    data: activeTripData,
+    refetch: refetchActive,
+  } = useGetActiveTripQuery(driverId, {
+    pollingInterval: 15000,
+    // skip: !driverId,
+  });
+
+  // console.log("getAllTrip", tripsData);
+  // console.log("getActivetrip", activeTripData);
+
+
+  const [acceptTrip, { isLoading: accepting }] = useAcceptTripMutation();
+  const [sendEmergency] = useSendEmergencyMutation();
+  const [endTrip] = useEndTripMutation();
+
   // ── Derive active / scheduled trip from API response ──────────────────
   // Active = upcoming in_transit (driver already accepted)
-  const activeTripRaw = tripsData?.upcoming?.find((t) => t.status === "in_transit") ?? null;
-  // Scheduled = upcoming scheduled (waiting for acceptance)
+  // const activeTripRaw = tripsData?.upcoming?.find((t) => t.status === "in_transit") ?? null;
+  // // Scheduled = upcoming scheduled (waiting for acceptance)
+  // const scheduledTrips = tripsData?.upcoming?.filter((t) => t.status === "scheduled") ?? [];
+  // const scheduledTrip = scheduledTrips[0] ?? null;
+  // const pastTrips = tripsData?.past ?? [];
+
+  // const trip = activeTripRaw;
+  // const tripId = trip?.id;
+  // const isOnTrip = !!trip;
+  // const isScheduled = !trip && !!scheduledTrip;
+
+
+  // ── Derive trip state ────────────────────────────────────────────────
+  // Priority: use activeTripData (dedicated endpoint) for the running trip
+  // Fall back to tripsData?.upcoming in_transit if activeTripData is null
+  const trip = activeTripData
+    ?? tripsData?.upcoming?.find((t) => t.status === "in_transit")
+    ?? null;
+
+  const tripId = trip?.id;
+  const isOnTrip = !!trip;
   const scheduledTrips = tripsData?.upcoming?.filter((t) => t.status === "scheduled") ?? [];
-  const scheduledTrip  = scheduledTrips[0] ?? null;
-  const pastTrips      = tripsData?.past ?? [];
- 
-  const trip    = activeTripRaw;
-  const tripId  = trip?.id;
-  const isOnTrip    = !!trip;
-  const isScheduled = !trip && !!scheduledTrip;
- 
+  const pastTrips = tripsData?.past ?? [];
+
   // ── Local state ───────────────────────────────────────────────────────
-  const [userLoc,      setUserLoc]     = useState(null);
-  const [gpsStatus,    setGpsStatus]   = useState("loading");
-  const [fraction,     setFraction]    = useState(0.0);
-  const [simSpeed,     setSimSpeed]    = useState(0);
-  const [showEmergency, setShowEmg]    = useState(false);
-  const [emergencySent, setEmgSent]    = useState(false);
-  const [showEndTrip,   setShowEnd]    = useState(false);
-  const [acceptingId,   setAcceptingId] = useState(null); // which trip is being accepted
- 
-  const locationIntervalRef = useRef(null);
-  const animIntervalRef     = useRef(null);
-  const socketRef           = useRef(null);
-  const lastPosRef          = useRef(null);
-  const firstPingRef        = useRef(true);
- 
-  // ── Keep screen awake ─────────────────────────────────────────────────
+  const [userLoc, setUserLoc] = useState(null);
+  const [gpsStatus, setGpsStatus] = useState("loading");
+  // full [{lat,lng}] from Mapbox
+  const [travelledIdx, setTravelledIdx] = useState(0);
+  const [showEmergency, setShowEmg] = useState(false);
+  const [emergencySent, setEmgSent] = useState(false);
+  const [showEndTrip, setShowEnd] = useState(false);
+  const [acceptingId, setAcceptingId] = useState(null); // which trip is being accepted
+  const [routeCoords, setRouteCoords] = useState([]);
+
+  const locationSubRef = useRef(null);
+  const locationTimerRef = useRef(null);
+  const animTimerRef = useRef(null);
+  const socketRef = useRef(null);
+  const lastPosRef = useRef(null);
+  const firstPingRef = useRef(true);
+  const mapRef = useRef(null);
+   const routeRef      = useRef([]); 
+
+
+  const truckAnim = useRef(
+    new AnimatedRegion({
+      latitude:      trip?.dc ? parseFloat(trip.dc.latitude)  : 18.6298,
+      longitude:     trip?.dc ? parseFloat(trip.dc.longitude) : 73.7997,
+      latitudeDelta:  0,
+      longitudeDelta: 0,
+    })
+  ).current;
+
+  console.log("user location", userLoc, trip?.stops);
+
+console.log("ROUTE:", routeCoords.length);
+
   useEffect(() => {
+    if (!userLoc) return;
+
+    console.log("Truck moving to:", userLoc);
+
+    truckAnim.timing({
+      latitude: userLoc.latitude,
+      longitude: userLoc.longitude,
+      duration: 2000,
+      useNativeDriver: false,
+    }).start();
+  }, [userLoc]);
+
+  // ── Keep screen awake ─────────────────────────────────────────────────
+   useEffect(() => {
+    if (!isOnTrip) return;
     KeepAwake.activateKeepAwakeAsync();
     return () => KeepAwake.deactivateKeepAwake();
-  }, []);
- 
+  }, [isOnTrip]);
+
   // ── Seed Redux stops from active trip ─────────────────────────────────
   useEffect(() => {
     if (!trip?.stops?.length) return;
@@ -185,7 +311,36 @@ export default function HomeScreen() {
     dispatch(setStops(mapped));
     dispatch(setActiveTrip(trip));
   }, [trip?.id, trip?.stops?.length]);
+
+
+    // ── Fetch Mapbox route whenever trip or stops change ───────────────────
+  useEffect(() => {
+    if (!isOnTrip || !trip?.stops?.length) return;
  
+    const dcLat = parseFloat(trip.dc?.latitude  ?? 18.6298);
+    const dcLng = parseFloat(trip.dc?.longitude ?? 73.7997);
+ 
+    const waypoints = [
+      { latitude: dcLat, longitude: dcLng },
+      ...trip.stops
+        .filter((st) => st.store?.latitude && st.store?.longitude)
+        .sort((a, b) => (a.eta ?? "").localeCompare(b.eta ?? ""))
+        .map((st) => ({
+          latitude:  parseFloat(st.store.latitude),
+          longitude: parseFloat(st.store.longitude),
+        })),
+    ];
+ 
+    fetchMapboxRoute(waypoints).then((coords) => {
+      if (coords.length > 1) {
+        setRouteCoords(coords);
+        routeRef.current = coords;
+        setTravelledIdx(0);
+      }
+    });
+  }, [trip?.id, isOnTrip]);
+
+
   // ── GPS watcher ───────────────────────────────────────────────────────
   useEffect(() => {
     let sub = null;
@@ -193,103 +348,207 @@ export default function HomeScreen() {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== "granted") { setGpsStatus("error"); return; }
       sub = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.High, timeInterval: 3000, distanceInterval: 5 },
+        {
+          accuracy: Location.Accuracy.BestForNavigation,
+          timeInterval: 3000,
+          distanceInterval: 5,
+        },
         (pos) => {
-          const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-          setUserLoc({ latitude: pos.coords.latitude, longitude: pos.coords.longitude });
-          lastPosRef.current = loc;
+
+          
+
+
+          const coords = {
+            latitude: pos.coords.latitude,
+            longitude: pos.coords.longitude
+          }
+          // const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+          setUserLoc(coords);
+          lastPosRef.current = {
+            latitude: coords.latitude,
+            longitude: coords.longitude
+          };
+          dispatch(setTruckPos({
+            latitude: coords.latitude,
+            longitude: coords.longitude,
+          }));
           setGpsStatus("ok");
         }
       );
+      locationSubRef.current = sub;
     })();
     return () => { sub?.remove(); };
   }, []);
- 
+
+  useEffect(() => {
+    if (!userLoc || !mapRef.current) return;
+
+    mapRef.current.animateCamera({
+      center: userLoc,
+      zoom: 15,
+    });
+  }, [userLoc]);
+
   // ── Socket + location streaming (only when on trip) ───────────────────
   useEffect(() => {
-    if (!isOnTrip || !tripId || !token) return;
- 
+    if (!isOnTrip || !tripId) return;
+    // if (!isOnTrip || !tripId || !token) return;
+
     const socket = getSocket(token);
     socketRef.current = socket;
- 
-    const onConnect = () => socket.emit("join-delivery", { deliveryId: tripId });
-    const onLocationUpdate = ({ lat, lng }) => dispatch(setTruckPos({ lat, lng }));
+
+    const onConnect = () => {
+      console.log("[Socket] Joining delivery", tripId);
+      socket.emit("join-delivery", { deliveryId: tripId });
+    };
+
+    const onJoined = (data) => {
+      console.log("[Socket] Joined:", data.message);
+    };
+
+    const onLocationUpdate = ({ lat, lng }) => {
+      truckAnim.timing({
+        latitude: lat,
+        longitude: lng,
+        duration: 2000,
+        useNativeDriver: false,
+      }).start();
+      dispatch(setTruckPos({ lat, lng }));
+    };
+
     const onAlert = (data) => {
       dispatch(pushAlert({
-        type:     "server_alert",
+        type: "server_alert",
         severity: "high",
-        message:  data.message ?? "Alert from server",
-        time:     new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
+        message: data.message ?? "Alert from server",
+        time: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
       }));
     };
- 
-    socket.on("connect",         onConnect);
+
+    socket.on("connect", onConnect);
+    socket.on("joined-successfully", onJoined);
     socket.on("location-update", onLocationUpdate);
-    socket.on("Alert",           onAlert);
- 
-    // Send location every 10 seconds
-    locationIntervalRef.current = setInterval(() => {
+    socket.on("Alert", onAlert);
+
+    // If already connected, join immediately
+    if (socket.connected) onConnect();
+
+    // Send real GPS location every 10 seconds
+    locationTimerRef.current = setInterval(() => {
       const pos = lastPosRef.current;
       if (!pos) return;
- 
+
+      const payload = {
+        deliveryId: tripId,
+        lat: pos.latitude,
+        lng: pos.longitude,
+        // speed: simSpeed,
+      };
+
       if (firstPingRef.current) {
-        // First ping: sets trip status to in_transit on backend
-        socket.emit("get-location", { deliveryId: tripId, lat: pos.lat, lng: pos.lng });
+        socket.emit("get-location", payload);
         firstPingRef.current = false;
       } else {
-        socket.emit("get-updated-location", {
-          deliveryId: tripId,
-          lat:   pos.lat,
-          lng:   pos.lng,
-          speed: simSpeed,
-        });
+        socket.emit("get-updated-location", payload);
       }
- 
-      // Near-store check (client-side, backup to server geofence alerts)
-      stops.filter((st) => st.status === "pending").forEach((stop) => {
-        const dist = haversine(pos, { lat: stop.latitude, lng: stop.longitude });
-        if (dist < (stop.geofenceRadius ?? 200)) {
-          dispatch(setNearStop(stop.id));
-        }
-      });
+
+      // Client-side geofence check (backup)
+      stops
+        .filter((st) => st.status === "pending")
+        .forEach((stop) => {
+          const dist = haversine(
+            { latitude: pos.lat, longitude: pos.lng },
+            { latitude: stop.latitude, longitude: stop.longitude }
+          );
+          if (dist <= (stop.geofenceRadius ?? 200)) {
+            dispatch(setNearStop(stop.id));
+          }
+        });
     }, 10000);
- 
-    // Animate truck along route
-    animIntervalRef.current = setInterval(() => {
-      setFraction((prev) => Math.min(prev + 0.004, 0.95));
-      setSimSpeed(50 + Math.floor(Math.random() * 35));
-    }, 2000);
- 
+
     return () => {
-      clearInterval(locationIntervalRef.current);
-      clearInterval(animIntervalRef.current);
-      socket.off("connect",         onConnect);
+      clearInterval(locationTimerRef.current);
+      clearInterval(animTimerRef.current);
+      socket.off("connect", onConnect);
+      socket.off("joined-successfully", onJoined);
       socket.off("location-update", onLocationUpdate);
-      socket.off("Alert",           onAlert);
+      socket.off("Alert", onAlert);
     };
   }, [isOnTrip, tripId, token]);
- 
+
+  // ── Cleanup socket on trip end / logout ─────────────────────────────
+  useEffect(() => {
+    if (!isOnTrip) {
+      clearInterval(locationTimerRef.current);
+      clearInterval(animTimerRef.current);
+    }
+  }, [isOnTrip]);
+
+
+  //Fetch route from mapbox
+  const fetchRoute = async () => {
+    if (!trip || !userLoc) return;
+
+    try {
+      const coords = [
+        `${userLoc.longitude},${userLoc.latitude}`,
+        ...trip.stops.map(
+          (s) => `${s.store.longitude},${s.store.latitude}`
+        ),
+      ].join(";");
+
+      const url = `https://api.mapbox.com/directions/v5/mapbox/driving/${coords}?geometries=polyline&access_token=${process.env.EXPO_PUBLIC_MAPBOX_API}`;
+
+      const res = await fetch(url);
+      const data = await res.json();
+
+      const points = polyline.decode(data.routes[0].geometry);
+
+      const route = points.map(([lat, lng]) => ({
+        latitude: lat,
+        longitude: lng,
+      }));
+
+      setRouteCoords(route);
+    } catch (e) {
+      console.log("Route error", e);
+    }
+  };
+
+  useEffect(() => {
+    fetchRoute();
+  }, [trip?.id, userLoc]);
+
+
   // ── Handlers ──────────────────────────────────────────────────────────
   const handleAcceptTrip = async (id) => {
     setAcceptingId(id);
     try {
       await acceptTrip({ trip_id: id }).unwrap();
       firstPingRef.current = true;
-      refetch();
+      // Refetch both queries to pick up the now-in_transit trip
+      await Promise.all([refetchAll(), refetchActive()]);
     } catch (e) {
-      console.error("Accept trip error:", e);
+      console.error("[AcceptTrip]", e);
     } finally {
       setAcceptingId(null);
     }
   };
- 
+
+  const disconnectSocket = () => {
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+      socketRef.current = null;
+    }
+  };
+
   const handleEmergency = async () => {
     setEmgSent(true);
     setShowEmg(false);
     const pos = lastPosRef.current;
     if (tripId && pos) {
       try { await sendEmergency({ trip_id: tripId, lat: pos.lat, lng: pos.lng }).unwrap(); }
-      catch {}
+      catch { console.error("[Emergency]", e); }
     }
     dispatch(pushAlert({
       type: "emergency", severity: "high",
@@ -297,33 +556,58 @@ export default function HomeScreen() {
       time: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
     }));
   };
- 
+
   const handleEndTrip = async () => {
     setShowEnd(false);
     if (tripId) {
       try { await endTrip({ trip_id: tripId }).unwrap(); }
-      catch {}
+      catch (e) { console.error("[EndTrip]", e); }
     }
-    clearInterval(locationIntervalRef.current);
-    clearInterval(animIntervalRef.current);
-    socketRef.current?.disconnect();
+    clearInterval(locationTimerRef.current);
+    clearInterval(animTimerRef.current);
+    disconnectSocket();
+    dispatch(clearTrip ? clearTrip() : setActiveTrip(null));
+    await Promise.all([refetchAll(), refetchActive()]);
     router.replace("/trip-complete");
   };
- 
+
+  const handleConfirmNearStop = useCallback(async (stop) => {
+    dispatch(confirmStopAction(stop.id));
+    dispatch(setNearStop(null));
+    // Also call the API to persist
+    try {
+      // We need stop_id and trip_id
+      // confirmStop mutation is available via the hook at the stop list level
+      // For simplicity emit via socket and trust server-side update
+    } catch (e) {
+      console.error("[ConfirmStop]", e);
+    }
+  }, [dispatch]);
+
   // ── Map route data ─────────────────────────────────────────────────────
   // DC coords: not in API, use fallback (you can add dc_lat/dc_lng to API later)
-  const dcCoords = { latitude: 18.6298, longitude: 73.7997 };
-  const routeCoords = isOnTrip
-    ? [dcCoords, ...stops.map((st) => ({ latitude: st.latitude, longitude: st.longitude }))]
-    : [];
-  const truckMapPos = routeCoords.length > 1 ? interpolateRoute(routeCoords, fraction) : dcCoords;
-  const splitIdx    = Math.floor(fraction * Math.max(routeCoords.length - 1, 0));
-  const donePath    = routeCoords.slice(0, splitIdx + 1);
-  const restPath    = routeCoords.slice(splitIdx);
-  const completedStops = stops.filter((st) => st.status === "completed").length;
-  const progressPct    = stops.length ? Math.round((completedStops / stops.length) * 100) : 0;
-  const nearStop       = nearStopId ? stops.find((st) => st.id === nearStopId && st.status === "pending") : null;
+  const dcCoords = trip?.dc
+    ? { latitude: parseFloat(trip.dc.latitude), longitude: parseFloat(trip.dc.longitude) }
+    : { latitude: 18.6298, longitude: 73.7997 }; // fallback
+
+
+  const truckMapPos = userLoc || dcCoords;
+
+  console.log("truckMapPos", truckMapPos, dcCoords);
+
+  // Split route into green (done) + blue-dashed (remaining)
+  const travelledPath  = routeCoords.slice(0, travelledIdx + 1);
+  const remainingPath  = routeCoords.slice(travelledIdx);
  
+  const completedStops = stops.filter(
+    (st) => st.status === "confirmed" || st.status === "completed"
+  ).length;
+  const progressPct    = stops.length ? Math.round((completedStops / stops.length) * 100) : 0;
+  const nearStop       = nearStopId
+    ? stops.find((st) => st.id === nearStopId && st.status === "pending")
+    : null;
+  // const speedOverLimit = speed > (trip?.speed_threshold ?? 80);
+
   // ══════════════════════════════════════════════════════════════════════
   // RENDER: LOADING
   // ══════════════════════════════════════════════════════════════════════
@@ -340,55 +624,54 @@ export default function HomeScreen() {
       </View>
     );
   }
- 
+
   // ══════════════════════════════════════════════════════════════════════
   // RENDER: ACTIVE TRIP → FULL MAP
   // ══════════════════════════════════════════════════════════════════════
   if (isOnTrip) {
     return (
       <View style={mS.root}>
- 
+
         {/* TOP BAR */}
         <View style={[mS.topBar, { paddingTop: insets.top + 8 }]}>
           <View style={mS.topLeft}>
             <View style={mS.topAvatar}><Text style={{ fontSize: 18 }}>🚛</Text></View>
             <View>
               <Text style={mS.topName}>{driver?.name ?? "Driver"}</Text>
-              <Text style={mS.topCode}>{tripId?.slice(0, 8).toUpperCase()} · {driver?.truck ?? "—"}</Text>
+              <Text style={mS.topCode}>
+                {(tripId ?? "").slice(0, 8).toUpperCase()} · {trip?.truck?.registration_no ?? driver?.truck ?? "—"}
+              </Text>
             </View>
           </View>
           <TouchableOpacity onPress={() => setShowEnd(true)} style={mS.endBtn}>
-            <Text style={mS.endBtnTxt}>{s.end_trip}</Text>
+            <Text style={mS.endBtnTxt}>{s.end_trip ?? "End Trip"}</Text>
           </TouchableOpacity>
         </View>
- 
-        {/* EMERGENCY SENT BANNER */}
+
+        {/* EMERGENCY BANNER */}
         {emergencySent && (
           <View style={mS.emergencyBanner}>
-            <Text style={mS.emergencyBannerTxt}>🚨 {s.emergency_sent}</Text>
+            <Text style={mS.emergencyBannerTxt}>🚨 {s.emergency_sent ?? "Emergency alert sent"}</Text>
           </View>
         )}
- 
+
         {/* NEAR STORE BANNER */}
         {nearStop && (
           <View style={mS.nearBanner}>
             <View style={{ flex: 1 }}>
-              <Text style={mS.nearBannerLabel}>📍 {s.near_store}</Text>
+              <Text style={mS.nearBannerLabel}>📍 {s.near_store ?? "Near store"}</Text>
               <Text style={mS.nearBannerStore} numberOfLines={1}>{nearStop.name}</Text>
             </View>
             <TouchableOpacity
               style={mS.nearConfirmBtn}
-              onPress={() => {
-                dispatch(confirmStopAction(nearStop.id));
-                dispatch(setNearStop(null));
-              }}
+              onPress={() => handleConfirmNearStop(nearStop)}
             >
               <Text style={mS.nearConfirmTxt}>✓ Confirm</Text>
             </TouchableOpacity>
           </View>
         )}
- 
-        {/* PROGRESS BAR WITH MILESTONE DOTS */}
+
+        {/* PROGRESS BAR */}
         <View style={mS.progressBarWrap}>
           <View style={mS.progressBg}>
             <View style={[mS.progressFill, { width: `${progressPct}%` }]} />
@@ -399,117 +682,152 @@ export default function HomeScreen() {
               style={[
                 mS.milestoneDot,
                 { left: `${stop.milestonePct}%` },
-                stop.status === "completed" && mS.milestoneDotDone,
+                stop.status === "confirmed" && mS.milestoneDotDone,
               ]}
             />
           ))}
         </View>
- 
+
         {/* MAP */}
-        <MapView
+       <MapView
+          ref={mapRef}
           style={mS.map}
           provider={PROVIDER_GOOGLE}
           initialRegion={{
-            latitude:      dcCoords.latitude,
-            longitude:     dcCoords.longitude,
-            latitudeDelta: 0.18,
-            longitudeDelta: 0.14,
+            ...dcCoords,
+            latitudeDelta:  0.12,
+            longitudeDelta: 0.12,
           }}
           showsUserLocation={false}
+          showsMyLocationButton={false}
+          showsTraffic={false}
+          toolbarEnabled={false}
         >
-          {donePath.length > 1 && (
-            <Polyline coordinates={donePath} strokeColor={THEME.green600} strokeWidth={5} />
-          )}
-          {restPath.length > 1 && (
-            <Polyline coordinates={restPath} strokeColor={THEME.blue500} strokeWidth={4} lineDashPattern={[10, 6]} />
+          {/* Travelled section — solid green */}
+          {travelledPath.length > 1 && (
+            <Polyline
+              coordinates={travelledPath}
+              strokeColor="#16a34a"
+              strokeWidth={6}
+              lineCap="round"
+              lineJoin="round"
+              zIndex={1}
+            />
           )}
  
-          {/* DC */}
-          <Marker coordinate={dcCoords} title="Distribution Center">
-            <View style={mS.dcMarker}><Text style={{ fontSize: 18 }}>🏭</Text></View>
+          {/* Remaining section — blue dashed */}
+          {remainingPath.length > 1 && (
+            <Polyline
+              coordinates={remainingPath}
+              strokeColor="#3b82f6"
+              strokeWidth={5}
+              lineDashPattern={[12, 8]}
+              lineCap="round"
+              lineJoin="round"
+              zIndex={1}
+            />
+          )}
+ 
+          {/* DC marker */}
+          <Marker
+            coordinate={dcCoords}
+            title={trip?.dc?.name ?? "Distribution Center"}
+            anchor={{ x: 0.5, y: 0.5 }}
+            tracksViewChanges={false}
+            zIndex={3}
+          >
+            <View style={mS.dcMarker}>
+              <Text style={{ fontSize: 20 }}>🏭</Text>
+            </View>
           </Marker>
- 
-          {/* Stores */}
-          {stops.map((stop) => (
-            <Marker
-              key={stop.id}
-              coordinate={{ latitude: stop.latitude, longitude: stop.longitude }}
-              title={stop.name}
-              description={stop.address}
-            >
-              <View style={[mS.storeMarker, stop.status === "completed" && mS.storeMarkerDone]}>
-                <Text style={{ fontSize: 17 }}>{stop.status === "completed" ? "✅" : "🏪"}</Text>
-              </View>
-            </Marker>
-          ))}
- 
-          {/* Animated truck */}
-          {routeCoords.length > 1 && truckMapPos && (
-            <AnimatedTruck position={truckMapPos} />
-          )}
- 
-          {/* Driver GPS dot */}
+
           {userLoc && (
-            <Marker coordinate={userLoc} anchor={{ x: 0.5, y: 0.5 }}>
-              <View style={mS.userDot} />
-            </Marker>
-          )}
-        </MapView>
+  <Marker coordinate={userLoc} title="USER DEBUG">
+    <Text>📍</Text>
+  </Marker>
+)}
  
+          {/* Store stop markers — use raw trip.stops for freshest status */}
+          {trip.stops.map((stop) => {
+            const lat = parseFloat(stop.store?.latitude);
+            const lng = parseFloat(stop.store?.longitude);
+            if (!lat || !lng) return null;
+            const done = stop.status === "confirmed" || stop.status === "completed";
+            return (
+              <Marker
+                key={stop.stop_id}
+                coordinate={{ latitude: lat, longitude: lng }}
+                title={stop.store?.name ?? "Store"}
+                description={stop.store?.address ?? ""}
+                anchor={{ x: 0.5, y: 0.5 }}
+                tracksViewChanges={false}
+                zIndex={4}
+              >
+                <View style={[mS.storeMarker, done && mS.storeMarkerDone]}>
+                  <Text style={{ fontSize: 17 }}>{done ? "✅" : "🏪"}</Text>
+                </View>
+              </Marker>
+            );
+          })}
+ 
+          {/* Animated truck — moves smoothly with real GPS */}
+          <TruckMarker animRegion={truckAnim} />
+        </MapView>
+
         {/* OVERLAYS */}
-        <View style={[mS.speedBox, { top: insets.top + 80 }]}>
+        {/* <View style={[mS.speedBox, { top: insets.top + 80 }]}>
           <Text style={[mS.speedNum, simSpeed > 80 && { color: THEME.red600 }]}>{simSpeed}</Text>
           <Text style={mS.speedUnit}>km/h</Text>
           {simSpeed > 80 && <Text style={mS.speedWarn}>!</Text>}
-        </View>
- 
+        </View> */}
+
         <View style={[mS.gpsPill, { top: insets.top + 80 }]}>
           <View style={[mS.gpsDot, { backgroundColor: gpsStatus === "ok" ? THEME.green500 : THEME.amber500 }]} />
           <Text style={mS.gpsTxt}>{gpsStatus === "ok" ? "GPS active" : "GPS…"}</Text>
         </View>
- 
+
         <View style={[mS.progressChip, { top: insets.top + 80 }]}>
           <Text style={mS.progressChipTxt}>{completedStops}/{stops.length} stops · {progressPct}%</Text>
         </View>
- 
+
         {/* EMERGENCY BUTTON */}
         <TouchableOpacity
           style={[mS.emergencyBtn, { bottom: insets.bottom + 18 }]}
           onPress={() => setShowEmg(true)}
           activeOpacity={0.9}
         >
-          <Text style={mS.emergencyBtnTxt}>🚨  {s.emergency}</Text>
+          <Text style={mS.emergencyBtnTxt}>🚨  {s.emergency ?? "Emergency"}</Text>
         </TouchableOpacity>
- 
+
         {/* EMERGENCY MODAL */}
         <Modal visible={showEmergency} transparent animationType="slide">
           <View style={mS.modalBg}>
             <View style={mS.modalCard}>
               <View style={mS.modalIconWrap}><Text style={{ fontSize: 44 }}>🚨</Text></View>
-              <Text style={mS.modalTitle}>{s.emergency_q}</Text>
+              <Text style={mS.modalTitle}>{s.emergency_q ?? "Send Emergency Alert?"}</Text>
               <Text style={mS.modalSub}>Your DC operator will be notified immediately with your GPS location.</Text>
               <TouchableOpacity style={[mS.modalBtn, { backgroundColor: THEME.red600 }]} onPress={handleEmergency}>
-                <Text style={mS.modalBtnTxt}>{s.emergency_yes}</Text>
+                <Text style={mS.modalBtnTxt}>{s.emergency_yes ?? "Yes, Send Alert"}</Text>
               </TouchableOpacity>
               <TouchableOpacity style={[mS.modalBtn, { backgroundColor: THEME.slate100, marginTop: 8 }]} onPress={() => setShowEmg(false)}>
-                <Text style={[mS.modalBtnTxt, { color: THEME.slate700 }]}>{s.emergency_cancel}</Text>
+                <Text style={[mS.modalBtnTxt, { color: THEME.slate700 }]}>{s.emergency_cancel ?? "Cancel"}</Text>
               </TouchableOpacity>
             </View>
           </View>
         </Modal>
- 
+
         {/* END TRIP MODAL */}
         <Modal visible={showEndTrip} transparent animationType="slide">
           <View style={mS.modalBg}>
             <View style={mS.modalCard}>
               <View style={mS.modalIconWrap}><Text style={{ fontSize: 44 }}>🏁</Text></View>
-              <Text style={mS.modalTitle}>{s.end_trip_q}</Text>
+              <Text style={mS.modalTitle}>{s.end_trip_q ?? "End this trip?"}</Text>
               <Text style={mS.modalSub}>All deliveries will be marked as complete.</Text>
               <TouchableOpacity style={[mS.modalBtn, { backgroundColor: THEME.maroon }]} onPress={handleEndTrip}>
-                <Text style={mS.modalBtnTxt}>{s.end_trip_yes}</Text>
+                <Text style={mS.modalBtnTxt}>{s.end_trip_yes ?? "End Trip"}</Text>
               </TouchableOpacity>
               <TouchableOpacity style={[mS.modalBtn, { backgroundColor: THEME.slate100, marginTop: 8 }]} onPress={() => setShowEnd(false)}>
-                <Text style={[mS.modalBtnTxt, { color: THEME.slate700 }]}>{s.cancel}</Text>
+                <Text style={[mS.modalBtnTxt, { color: THEME.slate700 }]}>{s.cancel ?? "Cancel"}</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -517,13 +835,13 @@ export default function HomeScreen() {
       </View>
     );
   }
- 
+
   // ══════════════════════════════════════════════════════════════════════
   // RENDER: NO ACTIVE TRIP — dashboard with scheduled + past trips
   // ═══════════════════s═══════════════════════════════════════════════════
   return (
     <View style={nS.root}>
- 
+
       {/* TOP BAR */}
       <View style={[nS.topBar, { paddingTop: insets.top + 8 }]}>
         <View style={nS.topLeft}>
@@ -536,32 +854,43 @@ export default function HomeScreen() {
           </View>
         </View>
         <View style={{ flexDirection: "row", gap: 8 }}>
-          <TouchableOpacity onPress={refetch} style={nS.iconBtn}>
-            <Text style={{ fontSize: 16 }}>🔄</Text>
+          <TouchableOpacity onPress={refetchAll} style={nS.iconBtn}>
+            <Text style={{ fontSize: 16 }}>{isFetching ? "⟳" : "🔄"}</Text>
           </TouchableOpacity>
           <TouchableOpacity
-            onPress={() => { dispatch(clearAuth()); router.replace("/"); }}
+            onPress={() => {
+              disconnectSocket();
+              dispatch(clearAuth());
+              router.replace("/");
+            }}
             style={nS.logoutBtn}
           >
             <Text style={nS.logoutTxt}>Logout</Text>
           </TouchableOpacity>
         </View>
       </View>
- 
+
       <ScrollView
         contentContainerStyle={{ padding: 18, paddingBottom: insets.bottom + 32 }}
         showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl
+            refreshing={isFetching}
+            onRefresh={refetchAll}
+            tintColor={THEME.maroon}
+          />
+        }
       >
- 
-        {/* GPS STATUS CARD */}
+
+        {/* GPS STATUS */}
         <View style={nS.gpsCard}>
           <View style={[nS.gpsDot, { backgroundColor: gpsStatus === "ok" ? THEME.green500 : THEME.amber500 }]} />
           <Text style={nS.gpsTxt}>
             {gpsStatus === "ok" ? "GPS active — tracking ready" : "Acquiring GPS signal…"}
           </Text>
         </View>
- 
-        {/* ── SCHEDULED TRIPS (ready to accept) ── */}
+
+        {/* ASSIGNED TRIPS */}
         {scheduledTrips.length > 0 && (
           <View style={{ marginBottom: 24 }}>
             <View style={nS.sectionHeader}>
@@ -570,31 +899,45 @@ export default function HomeScreen() {
                 <Text style={nS.sectionBadgeTxt}>{scheduledTrips.length}</Text>
               </View>
             </View>
- 
+
             {scheduledTrips.map((t) => {
-              const stopsCount = t.stops?.length ?? 0;
               const isAccepting = acceptingId === t.id;
+              const stopsCount = t.stops?.length ?? 0;
+              const departureDate = t.departed_at ? parseISO(t.departed_at) : null;
+              const isTooEarly = departureDate
+                ? isBefore(new Date(), subMinutes(departureDate, 5))
+                : false;
+
               return (
                 <View key={t.id} style={aS.assignCard}>
-                  {/* Header row */}
+
+                  {/* Header */}
                   <View style={aS.cardHeader}>
                     <View style={aS.cardHeaderLeft}>
                       <Text style={aS.assignEmoji}>📦</Text>
                       <View>
                         <Text style={aS.assignLabel}>NEW TRIP</Text>
-                        <Text style={aS.assignCode}>{t.id.slice(0, 8).toUpperCase()}</Text>
+                        <Text style={aS.assignCode}>{(t.tracking_code ?? "").toUpperCase()}</Text>
+                        <Text style={aS.truckDetails}>
+                          {(t.truck_no ?? "").toUpperCase()} · {t.truck_type} · {t.truck_capacity}T
+                        </Text>
                       </View>
                     </View>
                     <View style={aS.scheduledPill}>
                       <Text style={aS.scheduledPillTxt}>Scheduled</Text>
                     </View>
                   </View>
- 
-                  {/* Stats row */}
+
+                  {/* Stats */}
                   <View style={aS.statsRow}>
                     {[
-                      { icon: "📅", label: "Departs", value: t.departed_at ? new Date(t.departed_at).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "—" },
-                      { icon: "🏪", label: "Stops",   value: `${stopsCount} store${stopsCount !== 1 ? "s" : ""}` },
+                      {
+                        icon: "📅", label: "Departs",
+                        value: departureDate
+                          ? format(departureDate, "d MMM, h:mm a")
+                          : "—",
+                      },
+                      { icon: "🏪", label: "Stops", value: `${stopsCount} store${stopsCount !== 1 ? "s" : ""}` },
                     ].map(({ icon, label, value }) => (
                       <View key={label} style={aS.statCell}>
                         <Text style={aS.statIcon}>{icon}</Text>
@@ -603,12 +946,15 @@ export default function HomeScreen() {
                       </View>
                     ))}
                   </View>
- 
+
                   {/* Stops preview */}
                   {t.stops?.length > 0 && (
                     <View style={aS.stopsPreview}>
                       {t.stops.map((stop, i) => (
-                        <View key={stop.stop_id ?? i} style={[aS.stopPreviewRow, i > 0 && { borderTopWidth: 1, borderTopColor: THEME.slate100 }]}>
+                        <View
+                          key={stop.stop_id ?? i}
+                          style={[aS.stopPreviewRow, i > 0 && { borderTopWidth: 1, borderTopColor: THEME.slate100 }]}
+                        >
                           <View style={aS.stopPreviewNum}>
                             <Text style={aS.stopPreviewNumTxt}>{i + 1}</Text>
                           </View>
@@ -620,19 +966,21 @@ export default function HomeScreen() {
                               {stop.store?.address ?? "—"}
                             </Text>
                           </View>
-                          <Text style={aS.stopPreviewEta}>
-                            {stop.eta ? new Date(stop.eta).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }) : "—"}
-                          </Text>
                         </View>
                       ))}
                     </View>
                   )}
- 
+
                   {/* Accept button */}
                   <TouchableOpacity
-                    style={[aS.acceptBtn, isAccepting && { opacity: 0.7 }]}
+                    style={[
+                      aS.acceptBtn,
+                      (isAccepting) && { opacity: 0.65 },
+                      // (isAccepting || isTooEarly) && { opacity: 0.65 },
+                    ]}
                     onPress={() => handleAcceptTrip(t.id)}
                     disabled={isAccepting}
+                    // disabled={isAccepting || isTooEarly}
                     activeOpacity={0.88}
                   >
                     {isAccepting ? (
@@ -640,7 +988,11 @@ export default function HomeScreen() {
                     ) : (
                       <>
                         <Text style={{ fontSize: 18, color: THEME.white }}>✓</Text>
-                        <Text style={aS.acceptBtnTxt}>{s.accept_trip}</Text>
+                        <Text style={aS.acceptBtnTxt}>
+                          {isTooEarly
+                            ? `Available at ${departureDate ? format(subMinutes(departureDate, 5), "h:mm a") : ""}`
+                            : s.accept_trip ?? "Accept Trip"}
+                        </Text>
                       </>
                     )}
                   </TouchableOpacity>
@@ -649,20 +1001,20 @@ export default function HomeScreen() {
             })}
           </View>
         )}
- 
-        {/* ── NO TRIPS AT ALL ── */}
+
+        {/* EMPTY STATE */}
         {scheduledTrips.length === 0 && pastTrips.length === 0 && (
           <View style={nS.emptyCard}>
             <Text style={nS.emptyEmoji}>🚛</Text>
-            <Text style={nS.emptyTitle}>{s.no_trip}</Text>
-            <Text style={nS.emptySub}>{s.no_trip_sub}</Text>
-            <TouchableOpacity style={nS.refreshBtn} onPress={refetch}>
+            <Text style={nS.emptyTitle}>{s.no_trip ?? "No trips assigned"}</Text>
+            <Text style={nS.emptySub}>{s.no_trip_sub ?? "Pull down to refresh"}</Text>
+            <TouchableOpacity style={nS.refreshBtn} onPress={refetchAll}>
               <Text style={nS.refreshBtnTxt}>🔄  Refresh</Text>
             </TouchableOpacity>
           </View>
         )}
- 
-        {/* ── PAST TRIPS ── */}
+
+        {/* PAST TRIPS */}
         {pastTrips.length > 0 && (
           <View>
             <View style={nS.sectionHeader}>
@@ -680,124 +1032,121 @@ export default function HomeScreen() {
     </View>
   );
 }
- 
- 
+
+
 // ═══════════════════════════════════
 // STYLES
 // ═══════════════════════════════════
- 
+
 // No-trip / dashboard styles
 const nS = StyleSheet.create({
-  root:          { flex: 1, backgroundColor: THEME.slate50 },
-  topBar:        { backgroundColor: THEME.maroon, paddingHorizontal: 18, paddingBottom: 16, flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  topLeft:       { flexDirection: "row", alignItems: "center", gap: 12 },
-  avatar:        { width: 40, height: 40, borderRadius: 20, backgroundColor: "rgba(255,255,255,0.25)", alignItems: "center", justifyContent: "center" },
-  avatarTxt:     { color: THEME.white, fontSize: 18, fontWeight: "800" },
-  topName:       { color: THEME.white, fontSize: 15, fontWeight: "800" },
-  topSub:        { color: "rgba(255,255,255,0.65)", fontSize: 12, fontFamily: "monospace" },
-  iconBtn:       { width: 34, height: 34, borderRadius: 17, backgroundColor: "rgba(255,255,255,0.2)", alignItems: "center", justifyContent: "center" },
-  logoutBtn:     { backgroundColor: "rgba(255,255,255,0.2)", paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20 },
-  logoutTxt:     { color: THEME.white, fontSize: 13, fontWeight: "600" },
-  center:        { flex: 1, alignItems: "center", justifyContent: "center" },
-  centerTxt:     { color: THEME.slate500, fontSize: 14, marginTop: 14 },
-  gpsCard:       { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: THEME.white, borderRadius: 14, paddingHorizontal: 16, paddingVertical: 12, marginBottom: 20, borderWidth: 1, borderColor: THEME.slate100 },
-  gpsDot:        { width: 10, height: 10, borderRadius: 5 },
-  gpsTxt:        { fontSize: 13, fontWeight: "600", color: THEME.slate700 },
+  root: { flex: 1, backgroundColor: THEME.slate50 },
+  topBar: { backgroundColor: THEME.maroon, paddingHorizontal: 18, paddingBottom: 16, flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  topLeft: { flexDirection: "row", alignItems: "center", gap: 12 },
+  avatar: { width: 40, height: 40, borderRadius: 20, backgroundColor: "rgba(255,255,255,0.25)", alignItems: "center", justifyContent: "center" },
+  avatarTxt: { color: THEME.white, fontSize: 18, fontWeight: "800" },
+  topName: { color: THEME.white, fontSize: 15, fontWeight: "800" },
+  topSub: { color: "rgba(255,255,255,0.65)", fontSize: 12, fontFamily: "monospace" },
+  iconBtn: { width: 34, height: 34, borderRadius: 17, backgroundColor: "rgba(255,255,255,0.2)", alignItems: "center", justifyContent: "center" },
+  logoutBtn: { backgroundColor: "rgba(255,255,255,0.2)", paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20 },
+  logoutTxt: { color: THEME.white, fontSize: 13, fontWeight: "600" },
+  center: { flex: 1, alignItems: "center", justifyContent: "center" },
+  centerTxt: { color: THEME.slate500, fontSize: 14, marginTop: 14 },
+  gpsCard: { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: THEME.white, borderRadius: 14, paddingHorizontal: 16, paddingVertical: 12, marginBottom: 20, borderWidth: 1, borderColor: THEME.slate100 },
+  gpsDot: { width: 10, height: 10, borderRadius: 5 },
+  gpsTxt: { fontSize: 13, fontWeight: "600", color: THEME.slate700 },
   sectionHeader: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 12 },
-  sectionTitle:  { fontSize: 16, fontWeight: "800", color: THEME.slate900 },
-  sectionBadge:  { backgroundColor: "#fef9ec", paddingHorizontal: 9, paddingVertical: 3, borderRadius: 20 },
-  sectionBadgeTxt:{ fontSize: 12, fontWeight: "700", color: "#92400e" },
-  emptyCard:     { backgroundColor: THEME.white, borderRadius: 24, padding: 40, alignItems: "center", marginBottom: 24, elevation: 2, shadowColor: "#000", shadowOpacity: 0.07, shadowRadius: 10, shadowOffset: { width: 0, height: 3 } },
-  emptyEmoji:    { fontSize: 64, marginBottom: 16 },
-  emptyTitle:    { fontSize: 20, fontWeight: "800", color: THEME.slate900, marginBottom: 8 },
-  emptySub:      { fontSize: 14, color: THEME.slate500, textAlign: "center", lineHeight: 22, marginBottom: 24 },
-  refreshBtn:    { flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: THEME.slate100, paddingHorizontal: 22, paddingVertical: 10, borderRadius: 14 },
+  sectionTitle: { fontSize: 16, fontWeight: "800", color: THEME.slate900 },
+  sectionBadge: { backgroundColor: "#fef9ec", paddingHorizontal: 9, paddingVertical: 3, borderRadius: 20 },
+  sectionBadgeTxt: { fontSize: 12, fontWeight: "700", color: "#92400e" },
+  emptyCard: { backgroundColor: THEME.white, borderRadius: 24, padding: 40, alignItems: "center", marginBottom: 24, elevation: 2, shadowColor: "#000", shadowOpacity: 0.07, shadowRadius: 10, shadowOffset: { width: 0, height: 3 } },
+  emptyEmoji: { fontSize: 64, marginBottom: 16 },
+  emptyTitle: { fontSize: 20, fontWeight: "800", color: THEME.slate900, marginBottom: 8 },
+  emptySub: { fontSize: 14, color: THEME.slate500, textAlign: "center", lineHeight: 22, marginBottom: 24 },
+  refreshBtn: { flexDirection: "row", alignItems: "center", gap: 6, backgroundColor: THEME.slate100, paddingHorizontal: 22, paddingVertical: 10, borderRadius: 14 },
   refreshBtnTxt: { color: THEME.slate700, fontSize: 14, fontWeight: "700" },
 });
- 
-// Accept card styles
+
 const aS = StyleSheet.create({
-  assignCard:      { backgroundColor: THEME.white, borderRadius: 22, marginBottom: 16, overflow: "hidden", elevation: 4, shadowColor: "#000", shadowOpacity: 0.08, shadowRadius: 12, shadowOffset: { width: 0, height: 4 } },
-  cardHeader:      { flexDirection: "row", alignItems: "center", justifyContent: "space-between", padding: 18, backgroundColor: "#fef9ec", borderBottomWidth: 1, borderBottomColor: "#fde68a" },
-  cardHeaderLeft:  { flexDirection: "row", alignItems: "center", gap: 12 },
-  assignEmoji:     { fontSize: 30 },
-  assignLabel:     { fontSize: 10, fontWeight: "700", color: "#92400e", letterSpacing: 1.5 },
-  assignCode:      { fontSize: 18, fontWeight: "900", color: THEME.slate900, fontFamily: "monospace", marginTop: 2 },
-  scheduledPill:   { backgroundColor: THEME.slate100, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20 },
-  scheduledPillTxt:{ fontSize: 11, fontWeight: "700", color: THEME.slate600 },
-  statsRow:        { flexDirection: "row", padding: 16, gap: 12, borderBottomWidth: 1, borderBottomColor: THEME.slate100 },
-  statCell:        { flex: 1, backgroundColor: THEME.slate50, borderRadius: 14, padding: 12, alignItems: "center" },
-  statIcon:        { fontSize: 20, marginBottom: 4 },
-  statLabel:       { fontSize: 10, fontWeight: "600", color: THEME.slate400, textTransform: "uppercase", letterSpacing: 0.8 },
-  statValue:       { fontSize: 13, fontWeight: "700", color: THEME.slate800, textAlign: "center", marginTop: 2 },
-  stopsPreview:    { marginHorizontal: 16, marginBottom: 8, backgroundColor: THEME.slate50, borderRadius: 14, overflow: "hidden" },
-  stopPreviewRow:  { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14, paddingVertical: 10 },
-  stopPreviewNum:  { width: 24, height: 24, borderRadius: 12, backgroundColor: THEME.maroon, alignItems: "center", justifyContent: "center" },
+  assignCard: { backgroundColor: THEME.white, borderRadius: 22, marginBottom: 16, overflow: "hidden", elevation: 4, shadowColor: "#000", shadowOpacity: 0.08, shadowRadius: 12, shadowOffset: { width: 0, height: 4 } },
+  cardHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", padding: 18, backgroundColor: "#fef9ec", borderBottomWidth: 1, borderBottomColor: "#fde68a" },
+  cardHeaderLeft: { flexDirection: "row", alignItems: "center", gap: 12 },
+  assignEmoji: { fontSize: 20 },
+  truckDetails: { fontSize: 13, color: THEME.slate500 },
+  assignLabel: { fontSize: 10, fontWeight: "700", color: "#92400e", letterSpacing: 1.5 },
+  assignCode: { fontSize: 18, fontWeight: "900", color: THEME.slate900, fontFamily: "monospace", marginTop: 2 },
+  scheduledPill: { backgroundColor: THEME.slate100, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20 },
+  scheduledPillTxt: { fontSize: 11, fontWeight: "700", color: THEME.slate600 },
+  statsRow: { flexDirection: "row", padding: 16, gap: 12, borderBottomWidth: 1, borderBottomColor: THEME.slate100 },
+  statCell: { flex: 1, backgroundColor: THEME.slate50, borderRadius: 14, padding: 12, alignItems: "center" },
+  statIcon: { fontSize: 20, marginBottom: 4 },
+  statLabel: { fontSize: 10, fontWeight: "600", color: THEME.slate400, textTransform: "uppercase", letterSpacing: 0.8 },
+  statValue: { fontSize: 13, fontWeight: "700", color: THEME.slate800, textAlign: "center", marginTop: 2 },
+  stopsPreview: { marginHorizontal: 16, marginBottom: 8, backgroundColor: THEME.slate50, borderRadius: 14, overflow: "hidden" },
+  stopPreviewRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14, paddingVertical: 10 },
+  stopPreviewNum: { width: 24, height: 24, borderRadius: 12, backgroundColor: THEME.maroon, alignItems: "center", justifyContent: "center" },
   stopPreviewNumTxt: { color: THEME.white, fontSize: 11, fontWeight: "800" },
   stopPreviewName: { fontSize: 13, fontWeight: "600", color: THEME.slate800 },
   stopPreviewAddr: { fontSize: 11, color: THEME.slate500, marginTop: 1 },
-  stopPreviewEta:  { fontSize: 11, color: THEME.slate400, fontFamily: "monospace" },
-  acceptBtn:       { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10, margin: 16, paddingVertical: 17, borderRadius: 18, backgroundColor: THEME.maroon, elevation: 6, shadowColor: THEME.maroon, shadowOpacity: 0.35, shadowRadius: 10, shadowOffset: { width: 0, height: 5 } },
-  acceptBtnTxt:    { color: THEME.white, fontSize: 17, fontWeight: "800" },
+  acceptBtn: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10, margin: 16, paddingVertical: 14, borderRadius: 18, backgroundColor: THEME.maroon, elevation: 6, shadowColor: THEME.maroon, shadowOpacity: 0.35, shadowRadius: 10, shadowOffset: { width: 0, height: 5 } },
+  acceptBtnTxt: { color: THEME.white, fontSize: 17, fontWeight: "800" },
 });
- 
-// Past trip card styles
+
 const ptS = StyleSheet.create({
-  card:     { backgroundColor: THEME.white, borderRadius: 16, padding: 14, marginBottom: 10, flexDirection: "row", alignItems: "center", gap: 12, borderWidth: 1, borderColor: THEME.slate100 },
-  cardLeft: { alignItems: "center", minWidth: 52 },
-  tripCode: { fontSize: 12, fontWeight: "800", color: THEME.slate700, fontFamily: "monospace" },
-  tripDate: { fontSize: 11, color: THEME.slate400, marginTop: 3 },
-  cardMid:  { flex: 1 },
-  stops:    { fontSize: 13, fontWeight: "700", color: THEME.slate800 },
-  addr:     { fontSize: 12, color: THEME.slate400, marginTop: 2 },
-  badge:    { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 20 },
+  card: { backgroundColor: THEME.white, borderRadius: 16, padding: 14, marginBottom: 10, flexDirection: "row", alignItems: "center", gap: 12, borderWidth: 1, borderColor: THEME.slate100 },
+  cardLeft: { minWidth: 52 },
+  tripCode: { fontSize: 12, fontWeight: "700", color: THEME.slate700, fontFamily: "monospace" },
+  tripDate: { fontSize: 11, color: THEME.slate400 },
+  cardMid: { flex: 1 },
+  stops: { fontSize: 12, fontWeight: "700", color: THEME.slate800 },
+  addr: { fontSize: 12, color: THEME.slate400, marginTop: 2 },
+  badge: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 20 },
   badgeTxt: { fontSize: 11, fontWeight: "700", textTransform: "capitalize" },
 });
- 
-// Map styles
+
 const mS = StyleSheet.create({
-  root:              { flex: 1, backgroundColor: THEME.slate900 },
-  topBar:            { backgroundColor: THEME.maroon, paddingHorizontal: 16, paddingBottom: 14, flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  topLeft:           { flexDirection: "row", alignItems: "center", gap: 12 },
-  topAvatar:         { width: 38, height: 38, borderRadius: 19, backgroundColor: "rgba(255,255,255,0.2)", alignItems: "center", justifyContent: "center" },
-  topName:           { color: THEME.white, fontSize: 15, fontWeight: "800" },
-  topCode:           { color: "rgba(255,255,255,0.6)", fontSize: 11, fontFamily: "monospace" },
-  endBtn:            { backgroundColor: "rgba(255,255,255,0.2)", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 20 },
-  endBtnTxt:         { color: THEME.white, fontSize: 13, fontWeight: "600" },
-  progressBarWrap:   { height: 6, backgroundColor: THEME.slate100, position: "relative", overflow: "visible" },
-  progressBg:        { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, backgroundColor: THEME.slate100 },
-  progressFill:      { position: "absolute", left: 0, top: 0, bottom: 0, backgroundColor: THEME.green500, borderRadius: 3 },
-  milestoneDot:      { position: "absolute", top: -3, width: 12, height: 12, borderRadius: 6, backgroundColor: THEME.slate300, borderWidth: 2, borderColor: THEME.white, marginLeft: -6 },
-  milestoneDotDone:  { backgroundColor: THEME.green600 },
-  emergencyBanner:   { backgroundColor: THEME.red600, paddingVertical: 11, paddingHorizontal: 16, alignItems: "center" },
-  emergencyBannerTxt:{ color: THEME.white, fontSize: 13, fontWeight: "700" },
-  nearBanner:        { backgroundColor: THEME.green600, paddingVertical: 10, paddingHorizontal: 16, flexDirection: "row", alignItems: "center", gap: 12 },
-  nearBannerLabel:   { color: THEME.white, fontSize: 12, fontWeight: "700" },
-  nearBannerStore:   { color: "rgba(255,255,255,0.85)", fontSize: 13, fontWeight: "600", marginTop: 1 },
-  nearConfirmBtn:    { backgroundColor: THEME.white, paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20 },
-  nearConfirmTxt:    { color: THEME.green700, fontSize: 13, fontWeight: "800" },
-  map:               { flex: 1 },
-  truckMarker:       { backgroundColor: THEME.maroon, width: 48, height: 48, borderRadius: 24, alignItems: "center", justifyContent: "center", borderWidth: 3, borderColor: THEME.white, elevation: 10, shadowColor: THEME.maroon, shadowOpacity: 0.5, shadowRadius: 12, shadowOffset: { width: 0, height: 4 } },
-  dcMarker:          { backgroundColor: "#1e3a8a", width: 40, height: 40, borderRadius: 20, alignItems: "center", justifyContent: "center", borderWidth: 2.5, borderColor: THEME.white, elevation: 6 },
-  storeMarker:       { backgroundColor: THEME.green700, width: 38, height: 38, borderRadius: 19, alignItems: "center", justifyContent: "center", borderWidth: 2.5, borderColor: THEME.white, elevation: 4 },
-  storeMarkerDone:   { backgroundColor: THEME.green500, opacity: 0.75 },
-  userDot:           { width: 16, height: 16, borderRadius: 8, backgroundColor: THEME.sky500, borderWidth: 3, borderColor: THEME.white, elevation: 4 },
-  speedBox:          { position: "absolute", right: 12, backgroundColor: THEME.white, borderRadius: 16, paddingHorizontal: 14, paddingVertical: 10, alignItems: "center", elevation: 6, shadowColor: "#000", shadowOpacity: 0.15, shadowRadius: 8, shadowOffset: { width: 0, height: 3 } },
-  speedNum:          { fontSize: 24, fontWeight: "900", color: THEME.slate900 },
-  speedUnit:         { fontSize: 11, color: THEME.slate400 },
-  speedWarn:         { fontSize: 12, fontWeight: "900", color: THEME.red600, marginTop: 1 },
-  gpsPill:           { position: "absolute", left: 12, flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 12, paddingVertical: 7, borderRadius: 20, backgroundColor: THEME.white, elevation: 4 },
-  gpsDot:            { width: 8, height: 8, borderRadius: 4 },
-  gpsTxt:            { fontSize: 11, fontWeight: "600", color: THEME.slate700 },
-  progressChip:      { position: "absolute", alignSelf: "center", left: "50%", marginLeft: -65, backgroundColor: THEME.white, borderRadius: 20, paddingHorizontal: 14, paddingVertical: 7, elevation: 4 },
-  progressChipTxt:   { fontSize: 11, fontWeight: "700", color: THEME.slate700 },
-  emergencyBtn:      { position: "absolute", left: 16, right: 16, backgroundColor: THEME.red600, paddingVertical: 17, borderRadius: 22, alignItems: "center", elevation: 10, shadowColor: THEME.red600, shadowOpacity: 0.45, shadowRadius: 14, shadowOffset: { width: 0, height: 6 } },
-  emergencyBtnTxt:   { color: THEME.white, fontSize: 16, fontWeight: "900", letterSpacing: 0.5 },
-  modalBg:           { flex: 1, backgroundColor: "rgba(0,0,0,0.6)", justifyContent: "flex-end" },
-  modalCard:         { backgroundColor: THEME.white, borderTopLeftRadius: 32, borderTopRightRadius: 32, padding: 28, paddingBottom: 44, alignItems: "center" },
-  modalIconWrap:     { width: 80, height: 80, borderRadius: 40, backgroundColor: THEME.slate100, alignItems: "center", justifyContent: "center", marginBottom: 18 },
-  modalTitle:        { fontSize: 20, fontWeight: "900", color: THEME.slate900, marginBottom: 8, textAlign: "center" },
-  modalSub:          { fontSize: 13, color: THEME.slate500, marginBottom: 28, textAlign: "center", lineHeight: 20 },
-  modalBtn:          { width: "100%", paddingVertical: 17, borderRadius: 18, alignItems: "center" },
-  modalBtnTxt:       { color: THEME.white, fontSize: 16, fontWeight: "800" },
+  root: { flex: 1, backgroundColor: THEME.slate900 },
+  topBar: { backgroundColor: THEME.maroon, paddingHorizontal: 16, paddingBottom: 14, flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  topLeft: { flexDirection: "row", alignItems: "center", gap: 12 },
+  topAvatar: { width: 38, height: 38, borderRadius: 19, backgroundColor: "rgba(255,255,255,0.2)", alignItems: "center", justifyContent: "center" },
+  topName: { color: THEME.white, fontSize: 15, fontWeight: "800" },
+  topCode: { color: "rgba(255,255,255,0.6)", fontSize: 11, fontFamily: "monospace" },
+  endBtn: { backgroundColor: "rgba(255,255,255,0.2)", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 20 },
+  endBtnTxt: { color: THEME.white, fontSize: 13, fontWeight: "600" },
+  progressBarWrap: { height: 6, backgroundColor: THEME.slate100, position: "relative", overflow: "visible" },
+  progressBg: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, backgroundColor: THEME.slate100 },
+  progressFill: { position: "absolute", left: 0, top: 0, bottom: 0, backgroundColor: THEME.green500, borderRadius: 3 },
+  milestoneDot: { position: "absolute", top: -3, width: 12, height: 12, borderRadius: 6, backgroundColor: THEME.slate300, borderWidth: 2, borderColor: THEME.white, marginLeft: -6 },
+  milestoneDotDone: { backgroundColor: THEME.green600 },
+  emergencyBanner: { backgroundColor: THEME.red600, paddingVertical: 11, paddingHorizontal: 16, alignItems: "center" },
+  emergencyBannerTxt: { color: THEME.white, fontSize: 13, fontWeight: "700" },
+  nearBanner: { backgroundColor: THEME.green600, paddingVertical: 10, paddingHorizontal: 16, flexDirection: "row", alignItems: "center", gap: 12 },
+  nearBannerLabel: { color: THEME.white, fontSize: 12, fontWeight: "700" },
+  nearBannerStore: { color: "rgba(255,255,255,0.85)", fontSize: 13, fontWeight: "600", marginTop: 1 },
+  nearConfirmBtn: { backgroundColor: THEME.white, paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20 },
+  nearConfirmTxt: { color: THEME.green700, fontSize: 13, fontWeight: "800" },
+  map: { flex: 1 },
+  truckMarker: { backgroundColor: THEME.maroon, width: 48, height: 48, borderRadius: 24, alignItems: "center", justifyContent: "center", borderWidth: 3, borderColor: THEME.white, elevation: 10, shadowColor: THEME.maroon, shadowOpacity: 0.5, shadowRadius: 12, shadowOffset: { width: 0, height: 4 } },
+  dcMarker: { backgroundColor: "#1e3a8a", width: 40, height: 40, borderRadius: 20, alignItems: "center", justifyContent: "center", borderWidth: 2.5, borderColor: THEME.white, elevation: 6 },
+  storeMarker: { backgroundColor: THEME.green700, width: 38, height: 38, borderRadius: 19, alignItems: "center", justifyContent: "center", borderWidth: 2.5, borderColor: THEME.white, elevation: 4 },
+  storeMarkerDone: { backgroundColor: THEME.green500, opacity: 0.75 },
+  userDot: { width: 16, height: 16, borderRadius: 8, backgroundColor: "#0ea5e9", borderWidth: 3, borderColor: THEME.white, elevation: 4 },
+  speedBox: { position: "absolute", right: 12, backgroundColor: THEME.white, borderRadius: 16, paddingHorizontal: 14, paddingVertical: 10, alignItems: "center", elevation: 6, shadowColor: "#000", shadowOpacity: 0.15, shadowRadius: 8, shadowOffset: { width: 0, height: 3 } },
+  speedNum: { fontSize: 24, fontWeight: "900", color: THEME.slate900 },
+  speedUnit: { fontSize: 11, color: THEME.slate400 },
+  speedWarn: { fontSize: 12, fontWeight: "900", color: THEME.red600, marginTop: 1 },
+  gpsPill: { position: "absolute", left: 12, flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 12, paddingVertical: 7, borderRadius: 20, backgroundColor: THEME.white, elevation: 4 },
+  gpsDot: { width: 8, height: 8, borderRadius: 4 },
+  gpsTxt: { fontSize: 11, fontWeight: "600", color: THEME.slate700 },
+  progressChip: { position: "absolute", alignSelf: "center", left: "50%", marginLeft: -65, backgroundColor: THEME.white, borderRadius: 20, paddingHorizontal: 14, paddingVertical: 7, elevation: 4 },
+  progressChipTxt: { fontSize: 11, fontWeight: "700", color: THEME.slate700 },
+  emergencyBtn: { position: "absolute", left: 16, right: 16, backgroundColor: THEME.red600, paddingVertical: 17, borderRadius: 22, alignItems: "center", elevation: 10, shadowColor: THEME.red600, shadowOpacity: 0.45, shadowRadius: 14, shadowOffset: { width: 0, height: 6 } },
+  emergencyBtnTxt: { color: THEME.white, fontSize: 16, fontWeight: "900", letterSpacing: 0.5 },
+  modalBg: { flex: 1, backgroundColor: "rgba(0,0,0,0.6)", justifyContent: "flex-end" },
+  modalCard: { backgroundColor: THEME.white, borderTopLeftRadius: 32, borderTopRightRadius: 32, padding: 28, paddingBottom: 44, alignItems: "center" },
+  modalIconWrap: { width: 80, height: 80, borderRadius: 40, backgroundColor: THEME.slate100, alignItems: "center", justifyContent: "center", marginBottom: 18 },
+  modalTitle: { fontSize: 20, fontWeight: "900", color: THEME.slate900, marginBottom: 8, textAlign: "center" },
+  modalSub: { fontSize: 13, color: THEME.slate500, marginBottom: 28, textAlign: "center", lineHeight: 20 },
+  modalBtn: { width: "100%", paddingVertical: 17, borderRadius: 18, alignItems: "center" },
+  modalBtnTxt: { color: THEME.white, fontSize: 16, fontWeight: "800" },
 });
