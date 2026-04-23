@@ -100,7 +100,7 @@ export default function LocationCheckScreen() {
  
   return (
     <View style={[S.root, { paddingTop: insets.top, paddingBottom: insets.bottom + 24 }]}>
-      // Top maroon bar
+      {/* // Top maroon bar */}
       <View style={S.topBar}>
         <Text style={S.topBarTitle}>Fleet Driver</Text>
       </View>

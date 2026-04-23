@@ -28,49 +28,9 @@ import { format, parseISO, subMinutes, isBefore } from "date-fns";
 import { TRUCK_TYPE } from "../../constants/constants";
 import { haversine, mapStop } from "../../lib/tripHelpers";
 import { RefreshControl } from "react-native-gesture-handler";
+import Mapbox from '@rnmapbox/maps';
 
-// ── Helpers ───────────────────────────────────────────────────────────────
-// function haversine(a, b) {
-//   const R = 6371000, toRad = (d) => (d * Math.PI) / 180;
-//   const dLat = toRad(b.lat - a.lat), dLng = toRad(b.lng - a.lng);
-//   const x =
-//     Math.sin(dLat / 2) ** 2 +
-//     Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
-//   return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
-// }
-
-// function interpolateRoute(coords, fraction) {
-//   if (!coords?.length) return null;
-//   if (fraction <= 0) return coords[0];
-//   if (fraction >= 1) return coords[coords.length - 1];
-//   const maxIdx = coords.length - 1;
-//   const idx = Math.min(Math.floor(fraction * maxIdx), maxIdx - 1);
-//   const t = fraction * maxIdx - idx;
-//   return {
-//     latitude:
-//       coords[idx].latitude + t * (coords[idx + 1].latitude - coords[idx].latitude),
-//     longitude:
-//       coords[idx].longitude + t * (coords[idx + 1].longitude - coords[idx].longitude),
-//   };
-// }
-
-// Maps raw API stop → Redux stop shape
-// function mapStop(st, i, total) {
-//   return {
-//     id: st.stop_id ?? st.id,
-//     order: i + 1,
-//     name: st.store?.name ?? st.store_name ?? `Stop ${i + 1}`,
-//     address: st.store?.address ?? st.address ?? "",
-//     latitude: parseFloat(st.store?.latitude ?? st.latitude ?? 0),
-//     longitude: parseFloat(st.store?.longitude ?? st.longitude ?? 0),
-//     etaTime: st.eta
-//       ? new Date(st.eta).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })
-//       : "—",
-//     status: st.status === "confirmed" ? "completed" : st.status ?? "pending",
-//     geofenceRadius: parseInt(st.store?.geofence_radius ?? 200),
-//     milestonePct: Math.round(((i + 1) / (total + 1)) * 100),
-//   };
-// }
+Mapbox.setAccessToken(process.env.EXPO_PUBLIC_MAPBOX_API);
 
 
 // Decode Google-encoded polyline (Mapbox returns this for "polyline" format)
@@ -121,34 +81,7 @@ async function fetchMapboxRoute(waypoints) {
   }
 }
 
-// ── Animated truck marker ─────────────────────────────────────────────────
-function TruckMarker({ animRegion }) {
-  const pulse = useRef(new Animated.Value(1)).current;
-  useEffect(() => {
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulse, { toValue: 1.18, duration: 900, useNativeDriver: true }),
-        Animated.timing(pulse, { toValue: 1,    duration: 900, useNativeDriver: true }),
-      ])
-    );
-    loop.start();
-    return () => loop.stop();
-  }, []);
- 
-  return (
-    <Marker.Animated
-      coordinate={animRegion}
-      anchor={{ x: 0.5, y: 0.5 }}
-      tracksViewChanges={false}
-      flat
-      zIndex={10}
-    >
-      <Animated.View style={[mS.truckMarker, { transform: [{ scale: pulse }] }]}>
-        <Text style={{ fontSize: 22 }}>🚛</Text>
-      </Animated.View>
-    </Marker.Animated>
-  );
-}
+
 
 // ── Past trips mini-card ──────────────────────────────────────────────────
 function PastTripCard({ trip }) {
@@ -180,6 +113,94 @@ function PastTripCard({ trip }) {
     </View>
   );
 }
+
+
+
+function LiveMapboxNative({ routeCoords, truckPosition, stops, dcCoords }) {
+  if (!routeCoords?.length || !truckPosition) return null;
+
+  return (
+    <Mapbox.MapView style={{ flex: 1 }} styleURL={Mapbox.StyleURL.Street}>
+
+      <Mapbox.Camera
+        zoomLevel={14}
+        centerCoordinate={[truckPosition.longitude, truckPosition.latitude]}
+        animationMode="easeTo"
+        animationDuration={1000}
+      />
+
+      {/* Route */}
+      <Mapbox.ShapeSource
+        id="routeSource"
+        shape={{
+          type: "Feature",
+          geometry: {
+            type: "LineString",
+            coordinates: routeCoords.map(c => [c.longitude, c.latitude]),
+          },
+        }}
+      >
+        <Mapbox.LineLayer
+          id="routeLine"
+          style={{
+            lineColor: "#3b82f6",
+            lineWidth: 5,
+          }}
+        />
+      </Mapbox.ShapeSource>
+
+      {/* Truck */}
+      <Mapbox.PointAnnotation
+        id="truck"
+        coordinate={[truckPosition.longitude, truckPosition.latitude]}
+      >
+        <Text style={{ fontSize: 24 }}>🚛</Text>
+      </Mapbox.PointAnnotation>
+
+      {/* DC */}
+      <Mapbox.PointAnnotation
+        id="dc"
+        coordinate={[dcCoords.longitude, dcCoords.latitude]}
+      >
+        <Text>🏭</Text>
+      </Mapbox.PointAnnotation>
+
+      {/* Stops */}
+      {stops.map((stop) => (
+        <Mapbox.PointAnnotation
+          key={stop.id}
+          id={stop.id}
+          coordinate={[stop.longitude, stop.latitude]}
+        >
+          <Text>🏪</Text>
+        </Mapbox.PointAnnotation>
+      ))}
+    </Mapbox.MapView>
+  );
+}
+
+
+function getClosestIndex(route, pos) {
+  if (!route.length || !pos) return 0;
+
+  let minDist = Infinity;
+  let index = 0;
+
+  route.forEach((point, i) => {
+    const d =
+      Math.pow(point.latitude - pos.latitude, 2) +
+      Math.pow(point.longitude - pos.longitude, 2);
+
+    if (d < minDist) {
+      minDist = d;
+      index = i;
+    }
+  });
+
+  return index;
+}
+
+
 
 // ══════════════════════════════════════════════════════════════════════════
 // MAIN HOME SCREEN
@@ -225,17 +246,6 @@ export default function HomeScreen() {
   const [endTrip] = useEndTripMutation();
 
   // ── Derive active / scheduled trip from API response ──────────────────
-  // Active = upcoming in_transit (driver already accepted)
-  // const activeTripRaw = tripsData?.upcoming?.find((t) => t.status === "in_transit") ?? null;
-  // // Scheduled = upcoming scheduled (waiting for acceptance)
-  // const scheduledTrips = tripsData?.upcoming?.filter((t) => t.status === "scheduled") ?? [];
-  // const scheduledTrip = scheduledTrips[0] ?? null;
-  // const pastTrips = tripsData?.past ?? [];
-
-  // const trip = activeTripRaw;
-  // const tripId = trip?.id;
-  // const isOnTrip = !!trip;
-  // const isScheduled = !trip && !!scheduledTrip;
 
 
   // ── Derive trip state ────────────────────────────────────────────────
@@ -254,7 +264,6 @@ export default function HomeScreen() {
   const [userLoc, setUserLoc] = useState(null);
   const [gpsStatus, setGpsStatus] = useState("loading");
   // full [{lat,lng}] from Mapbox
-  const [travelledIdx, setTravelledIdx] = useState(0);
   const [showEmergency, setShowEmg] = useState(false);
   const [emergencySent, setEmgSent] = useState(false);
   const [showEndTrip, setShowEnd] = useState(false);
@@ -263,42 +272,50 @@ export default function HomeScreen() {
 
   const locationSubRef = useRef(null);
   const locationTimerRef = useRef(null);
-  const animTimerRef = useRef(null);
   const socketRef = useRef(null);
   const lastPosRef = useRef(null);
   const firstPingRef = useRef(true);
   const mapRef = useRef(null);
-   const routeRef      = useRef([]); 
-
-
-  const truckAnim = useRef(
-    new AnimatedRegion({
-      latitude:      trip?.dc ? parseFloat(trip.dc.latitude)  : 18.6298,
-      longitude:     trip?.dc ? parseFloat(trip.dc.longitude) : 73.7997,
-      latitudeDelta:  0,
-      longitudeDelta: 0,
-    })
-  ).current;
-
-  console.log("user location", userLoc, trip?.stops);
-
-console.log("ROUTE:", routeCoords.length);
+  const routeRef = useRef([]);
+  const [truckPosition, setTruckPosition] = useState(null);
 
   useEffect(() => {
     if (!userLoc) return;
 
-    console.log("Truck moving to:", userLoc);
+    const interval = setInterval(() => {
+      setTruckPosition(prev => {
+        if (!prev) return userLoc;
+        return {
+          latitude: prev.latitude + (userLoc.latitude - prev.latitude) * 0.2,
+          longitude: prev.longitude + (userLoc.longitude - prev.longitude) * 0.2,
+        };
+      });
+    }, 100);
 
-    truckAnim.timing({
-      latitude: userLoc.latitude,
-      longitude: userLoc.longitude,
-      duration: 2000,
-      useNativeDriver: false,
-    }).start();
+    return () => clearInterval(interval);
   }, [userLoc]);
 
+
+
+  console.log("user location", userLoc, trip?.stops);
+
+  console.log("ROUTE:", routeCoords.length);
+
+  // useEffect(() => {
+  //   if (!userLoc) return;
+
+  //   console.log("Truck moving to:", userLoc);
+
+  //   truckAnim.timing({
+  //     latitude: userLoc.latitude,
+  //     longitude: userLoc.longitude,
+  //     duration: 2000,
+  //     useNativeDriver: false,
+  //   }).start();
+  // }, [userLoc]);
+
   // ── Keep screen awake ─────────────────────────────────────────────────
-   useEffect(() => {
+  useEffect(() => {
     if (!isOnTrip) return;
     KeepAwake.activateKeepAwakeAsync();
     return () => KeepAwake.deactivateKeepAwake();
@@ -313,29 +330,28 @@ console.log("ROUTE:", routeCoords.length);
   }, [trip?.id, trip?.stops?.length]);
 
 
-    // ── Fetch Mapbox route whenever trip or stops change ───────────────────
+  // ── Fetch Mapbox route whenever trip or stops change ───────────────────
   useEffect(() => {
     if (!isOnTrip || !trip?.stops?.length) return;
- 
-    const dcLat = parseFloat(trip.dc?.latitude  ?? 18.6298);
+
+    const dcLat = parseFloat(trip.dc?.latitude ?? 18.6298);
     const dcLng = parseFloat(trip.dc?.longitude ?? 73.7997);
- 
+
     const waypoints = [
       { latitude: dcLat, longitude: dcLng },
       ...trip.stops
         .filter((st) => st.store?.latitude && st.store?.longitude)
         .sort((a, b) => (a.eta ?? "").localeCompare(b.eta ?? ""))
         .map((st) => ({
-          latitude:  parseFloat(st.store.latitude),
+          latitude: parseFloat(st.store.latitude),
           longitude: parseFloat(st.store.longitude),
         })),
     ];
- 
+
     fetchMapboxRoute(waypoints).then((coords) => {
       if (coords.length > 1) {
         setRouteCoords(coords);
         routeRef.current = coords;
-        setTravelledIdx(0);
       }
     });
   }, [trip?.id, isOnTrip]);
@@ -355,7 +371,7 @@ console.log("ROUTE:", routeCoords.length);
         },
         (pos) => {
 
-          
+
 
 
           const coords = {
@@ -407,12 +423,7 @@ console.log("ROUTE:", routeCoords.length);
     };
 
     const onLocationUpdate = ({ lat, lng }) => {
-      truckAnim.timing({
-        latitude: lat,
-        longitude: lng,
-        duration: 2000,
-        useNativeDriver: false,
-      }).start();
+
       dispatch(setTruckPos({ lat, lng }));
     };
 
@@ -457,7 +468,7 @@ console.log("ROUTE:", routeCoords.length);
         .filter((st) => st.status === "pending")
         .forEach((stop) => {
           const dist = haversine(
-            { latitude: pos.lat, longitude: pos.lng },
+            { latitude: pos.latitude, longitude: pos.longitude },
             { latitude: stop.latitude, longitude: stop.longitude }
           );
           if (dist <= (stop.geofenceRadius ?? 200)) {
@@ -468,7 +479,6 @@ console.log("ROUTE:", routeCoords.length);
 
     return () => {
       clearInterval(locationTimerRef.current);
-      clearInterval(animTimerRef.current);
       socket.off("connect", onConnect);
       socket.off("joined-successfully", onJoined);
       socket.off("location-update", onLocationUpdate);
@@ -480,44 +490,43 @@ console.log("ROUTE:", routeCoords.length);
   useEffect(() => {
     if (!isOnTrip) {
       clearInterval(locationTimerRef.current);
-      clearInterval(animTimerRef.current);
     }
   }, [isOnTrip]);
 
 
-  //Fetch route from mapbox
-  const fetchRoute = async () => {
-    if (!trip || !userLoc) return;
+  // //Fetch route from mapbox
+  // const fetchRoute = async () => {
+  //   if (!trip || !userLoc) return;
 
-    try {
-      const coords = [
-        `${userLoc.longitude},${userLoc.latitude}`,
-        ...trip.stops.map(
-          (s) => `${s.store.longitude},${s.store.latitude}`
-        ),
-      ].join(";");
+  //   try {
+  //     const coords = [
+  //       `${userLoc.longitude},${userLoc.latitude}`,
+  //       ...trip.stops.map(
+  //         (s) => `${s.store.longitude},${s.store.latitude}`
+  //       ),
+  //     ].join(";");
 
-      const url = `https://api.mapbox.com/directions/v5/mapbox/driving/${coords}?geometries=polyline&access_token=${process.env.EXPO_PUBLIC_MAPBOX_API}`;
+  //     const url = `https://api.mapbox.com/directions/v5/mapbox/driving/${coords}?geometries=polyline&access_token=${process.env.EXPO_PUBLIC_MAPBOX_API}`;
 
-      const res = await fetch(url);
-      const data = await res.json();
+  //     const res = await fetch(url);
+  //     const data = await res.json();
 
-      const points = polyline.decode(data.routes[0].geometry);
+  //     const points = polyline.decode(data.routes[0].geometry);
 
-      const route = points.map(([lat, lng]) => ({
-        latitude: lat,
-        longitude: lng,
-      }));
+  //     const route = points.map(([lat, lng]) => ({
+  //       latitude: lat,
+  //       longitude: lng,
+  //     }));
 
-      setRouteCoords(route);
-    } catch (e) {
-      console.log("Route error", e);
-    }
-  };
+  //     setRouteCoords(route);
+  //   } catch (e) {
+  //     console.log("Route error", e);
+  //   }
+  // };
 
-  useEffect(() => {
-    fetchRoute();
-  }, [trip?.id, userLoc]);
+  // useEffect(() => {
+  //   fetchRoute();
+  // }, [trip?.id, userLoc]);
 
 
   // ── Handlers ──────────────────────────────────────────────────────────
@@ -564,7 +573,6 @@ console.log("ROUTE:", routeCoords.length);
       catch (e) { console.error("[EndTrip]", e); }
     }
     clearInterval(locationTimerRef.current);
-    clearInterval(animTimerRef.current);
     disconnectSocket();
     dispatch(clearTrip ? clearTrip() : setActiveTrip(null));
     await Promise.all([refetchAll(), refetchActive()]);
@@ -586,6 +594,11 @@ console.log("ROUTE:", routeCoords.length);
 
   // ── Map route data ─────────────────────────────────────────────────────
   // DC coords: not in API, use fallback (you can add dc_lat/dc_lng to API later)
+
+
+
+
+
   const dcCoords = trip?.dc
     ? { latitude: parseFloat(trip.dc.latitude), longitude: parseFloat(trip.dc.longitude) }
     : { latitude: 18.6298, longitude: 73.7997 }; // fallback
@@ -595,15 +608,24 @@ console.log("ROUTE:", routeCoords.length);
 
   console.log("truckMapPos", truckMapPos, dcCoords);
 
+
+
+
+
+
   // Split route into green (done) + blue-dashed (remaining)
-  const travelledPath  = routeCoords.slice(0, travelledIdx + 1);
-  const remainingPath  = routeCoords.slice(travelledIdx);
- 
+
+  const splitIndex = getClosestIndex(routeCoords, truckPosition);
+
+  const doneCoords = routeCoords.slice(0, splitIndex + 1);
+  const remainingCoords = routeCoords.slice(splitIndex);
+
+
   const completedStops = stops.filter(
     (st) => st.status === "confirmed" || st.status === "completed"
   ).length;
-  const progressPct    = stops.length ? Math.round((completedStops / stops.length) * 100) : 0;
-  const nearStop       = nearStopId
+  const progressPct = stops.length ? Math.round((completedStops / stops.length) * 100) : 0;
+  const nearStop = nearStopId
     ? stops.find((st) => st.id === nearStopId && st.status === "pending")
     : null;
   // const speedOverLimit = speed > (trip?.speed_threshold ?? 80);
@@ -688,91 +710,15 @@ console.log("ROUTE:", routeCoords.length);
           ))}
         </View>
 
-        {/* MAP */}
-       <MapView
-          ref={mapRef}
-          style={mS.map}
-          provider={PROVIDER_GOOGLE}
-          initialRegion={{
-            ...dcCoords,
-            latitudeDelta:  0.12,
-            longitudeDelta: 0.12,
-          }}
-          showsUserLocation={false}
-          showsMyLocationButton={false}
-          showsTraffic={false}
-          toolbarEnabled={false}
-        >
-          {/* Travelled section — solid green */}
-          {travelledPath.length > 1 && (
-            <Polyline
-              coordinates={travelledPath}
-              strokeColor="#16a34a"
-              strokeWidth={6}
-              lineCap="round"
-              lineJoin="round"
-              zIndex={1}
-            />
-          )}
- 
-          {/* Remaining section — blue dashed */}
-          {remainingPath.length > 1 && (
-            <Polyline
-              coordinates={remainingPath}
-              strokeColor="#3b82f6"
-              strokeWidth={5}
-              lineDashPattern={[12, 8]}
-              lineCap="round"
-              lineJoin="round"
-              zIndex={1}
-            />
-          )}
- 
-          {/* DC marker */}
-          <Marker
-            coordinate={dcCoords}
-            title={trip?.dc?.name ?? "Distribution Center"}
-            anchor={{ x: 0.5, y: 0.5 }}
-            tracksViewChanges={false}
-            zIndex={3}
-          >
-            <View style={mS.dcMarker}>
-              <Text style={{ fontSize: 20 }}>🏭</Text>
-            </View>
-          </Marker>
 
-          {userLoc && (
-  <Marker coordinate={userLoc} title="USER DEBUG">
-    <Text>📍</Text>
-  </Marker>
-)}
- 
-          {/* Store stop markers — use raw trip.stops for freshest status */}
-          {trip.stops.map((stop) => {
-            const lat = parseFloat(stop.store?.latitude);
-            const lng = parseFloat(stop.store?.longitude);
-            if (!lat || !lng) return null;
-            const done = stop.status === "confirmed" || stop.status === "completed";
-            return (
-              <Marker
-                key={stop.stop_id}
-                coordinate={{ latitude: lat, longitude: lng }}
-                title={stop.store?.name ?? "Store"}
-                description={stop.store?.address ?? ""}
-                anchor={{ x: 0.5, y: 0.5 }}
-                tracksViewChanges={false}
-                zIndex={4}
-              >
-                <View style={[mS.storeMarker, done && mS.storeMarkerDone]}>
-                  <Text style={{ fontSize: 17 }}>{done ? "✅" : "🏪"}</Text>
-                </View>
-              </Marker>
-            );
-          })}
- 
-          {/* Animated truck — moves smoothly with real GPS */}
-          <TruckMarker animRegion={truckAnim} />
-        </MapView>
+        {truckPosition && (
+          <LiveMapboxNative
+            routeCoords={routeCoords}
+            truckPosition={truckPosition}
+            stops={trip.stops}
+            dcCoords={dcCoords}
+          />
+        )}
 
         {/* OVERLAYS */}
         {/* <View style={[mS.speedBox, { top: insets.top + 80 }]}>
