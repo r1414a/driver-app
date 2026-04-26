@@ -9,10 +9,24 @@
       "distribution": "internal"
     },
     "preview": {
-      "distribution": "internal"
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_MAPBOX_API": "public",
+        "EXPO_PUBLIC_API_URL": "https://iravya-software-hcwu.vercel.app"
+      }
     },
     "production": {
-      "autoIncrement": true
+      "autoIncrement": true,
+      "android": {
+        "buildType": "app-bundle"
+      },
+       "env": {
+        "EXPO_PUBLIC_MAPBOX_API": "public",
+        "EXPO_PUBLIC_API_URL": "https://iravya-software-hcwu.vercel.app"
+      }
     }
   },
   "submit": {

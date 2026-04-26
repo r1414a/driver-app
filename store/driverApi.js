@@ -1,9 +1,10 @@
 import { createApi, fetchBaseQuery } from "@reduxjs/toolkit/query/react";
 import * as SecureStore from "expo-secure-store";
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "http://192.168.0.163:5000";
+// const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "http://192.168.0.163:5000";
 //https://iravya-software-hcwu.vercel.app/health
-// const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "http://10.224.170.232:5000";
+const API_URL = "https://iravya-software-backend.onrender.com";
+// const API_URL = "http://10.224.170.232:5000";
 
 // export const driverApi = createApi({
 //   reducerPath: "driverApi",
@@ -150,7 +151,7 @@ export const driverApi = createApi({
     // POST /confirmdelivery/:stop_id/:trip_id
     confirmStop: builder.mutation({
       query: ({ stop_id, trip_id }) => ({
-        url: `/confirmdelivery/${stop_id}/${trip_id}`,
+        url: `/api/v1/driverapp/confirmdelivery/${stop_id}/${trip_id}`,
         method: "POST",
       }),
       invalidatesTags: ["ActiveTrip"],

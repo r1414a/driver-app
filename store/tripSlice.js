@@ -1,15 +1,15 @@
 import { createSlice } from "@reduxjs/toolkit";
- 
+
 const tripSlice = createSlice({
   name: "trip",
   initialState: {
-    activeTrip:  null,   // full trip object from API (in_transit)
-    stops:       [],     // normalised stops with status
-    alerts:      [],     // socket + local alerts
-    truckPos:    null,   // { lat, lng }
-    speed:       0,
-    gpsOk:       false,
-    nearStopId:  null,
+    activeTrip: null, // full trip object from API (in_transit)
+    stops: [], // normalised stops with status
+    alerts: [], // socket + local alerts
+    truckPos: null, // { lat, lng }
+    speed: 0,
+    gpsOk: false,
+    nearStopId: null,
   },
   reducers: {
     setActiveTrip: (s, a) => {
@@ -21,13 +21,19 @@ const tripSlice = createSlice({
     // Optimistic update for a single stop status from socket / local confirm
     updateStopStatus: (s, a) => {
       // payload: { stop_id, status }
-      const stop = s.stops.find(st => st.id === a.payload.stop_id || st.store_id === a.payload.stop_id);
+      const stop = s.stops.find(
+        (st) =>
+          st.id === a.payload.stop_id || st.store_id === a.payload.stop_id,
+      );
       if (stop) stop.status = a.payload.status;
     },
     confirmStop: (s, a) => {
       // payload: stop id (from nearStop banner)
-      const stop = s.stops.find(st => st.id === a.payload);
-      if (stop) stop.status = "completed";
+      const stop = s.stops.find((s) => s.id === a.payload);
+      if (stop) {
+        stop.status = "confirmed"; // ✅ match backend
+        stop.confirmed_at = new Date().toISOString();
+      }
     },
     setTruckPos: (s, a) => {
       s.truckPos = a.payload;
@@ -45,7 +51,10 @@ const tripSlice = createSlice({
       // Deduplicate by message + type within last 30 seconds
       const now = Date.now();
       const isDuplicate = s.alerts.some(
-        ex => ex.message === a.payload.message && ex.type === a.payload.type && now - ex._ts < 30000
+        (ex) =>
+          ex.message === a.payload.message &&
+          ex.type === a.payload.type &&
+          now - ex._ts < 30000,
       );
       if (!isDuplicate) {
         s.alerts = [
@@ -55,22 +64,30 @@ const tripSlice = createSlice({
       }
     },
     markAlertsRead: (s) => {
-      s.alerts = s.alerts.map(a => ({ ...a, unread: false }));
+      s.alerts = s.alerts.map((a) => ({ ...a, unread: false }));
     },
     clearTrip: (s) => {
       s.activeTrip = null;
-      s.stops      = [];
-      s.truckPos   = null;
-      s.speed      = 0;
+      s.stops = [];
+      s.truckPos = null;
+      s.speed = 0;
       s.nearStopId = null;
     },
   },
 });
- 
+
 export const {
-  setActiveTrip, setStops, confirmStop, updateStopStatus,
-  setTruckPos, setSpeed, setGpsOk, setNearStop,
-  pushAlert, markAlertsRead, clearTrip,
+  setActiveTrip,
+  setStops,
+  confirmStop,
+  updateStopStatus,
+  setTruckPos,
+  setSpeed,
+  setGpsOk,
+  setNearStop,
+  pushAlert,
+  markAlertsRead,
+  clearTrip,
 } = tripSlice.actions;
- 
+
 export default tripSlice.reducer;

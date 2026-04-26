@@ -40,7 +40,7 @@ export default function TripScreen() {
   const dispatch = useDispatch();
   const driver   = useSelector((s) => s.auth.driver);
   const { stops, activeTrip: trip } = useSelector((s) => s.trip);
-  console.log(stops, "activeTrip", trip);
+  console.log(stops, "ACTIVETRIPLFLDLFKDLKDFLDKFDLKFKL", trip);
   
 
   const [confirmStopApi, { isLoading: confirming }] = useConfirmStopMutation();
@@ -53,16 +53,25 @@ export default function TripScreen() {
     Linking.openURL(`https://maps.google.com/maps?daddr=${lat},${lng}`);
 
   const handleConfirmStop = async (stop) => {
-    // Optimistic update
+  try {
+    // optimistic update
     dispatch(confirmStop(stop.id));
-    try {
-      await confirmStopApi({ stop_id: stop.id, trip_id: trip.id }).unwrap();
-    } catch (e) {
-      console.error("[ConfirmStop]", e);
-      // Revert on failure
-      dispatch(updateStopStatus({ stop_id: stop.id, status: "arrived" }));
-    }
-  };
+
+    await confirmStopApi({
+      stop_id: stop.id,
+      trip_id: trip.id
+    }).unwrap();
+
+  } catch (e) {
+    console.error("[ConfirmStop ERROR]",e);
+
+    // rollback
+    dispatch(updateStopStatus({
+      stop_id: stop.id,
+      status: "arrived"
+    }));
+  }
+};
 
   return (
     <ScrollView
@@ -165,13 +174,14 @@ export default function TripScreen() {
               <View style={S.driverRow}>
                 <View style={S.driverAvatar}>
                   <Text style={S.driverAvatarTxt}>
-                    {(driver?.name ?? "D").split(" ").map((n) => n[0]).join("").slice(0, 2)}
+                    {(trip?.driver_name ?? "D").split(" ").map((n) => n[0]).join("").slice(0, 2)}
                   </Text>
                 </View>
                 <View style={{ flex: 1 }}>
-                  <Text style={S.driverName}>{driver?.name ?? "—"}</Text>
-                  <Text style={S.driverSub}>{driver?.id ?? "—"}</Text>
-                  <View style={S.starsRow}>
+                  <Text style={S.driverName}>{trip?.driver_name ?? "—"}</Text>
+                  <Text style={S.driverSub}>{`+91${trip?.driver_phone}` ?? "—"}</Text>
+                  <Text style={S.driverSub}>{trip?.driver_email ?? "—"}</Text>
+                  {/* <View style={S.starsRow}>
                     {[1, 2, 3, 4, 5].map((n) => (
                       <Text
                         key={n}
@@ -179,10 +189,10 @@ export default function TripScreen() {
                       >★</Text>
                     ))}
                     <Text style={S.ratingTxt}>{driver?.rating ?? "—"}</Text>
-                  </View>
+                  </View> */}
                 </View>
                 <View style={S.tripsBox}>
-                  <Text style={S.tripsNum}>{driver?.totalTrips ?? "—"}</Text>
+                  <Text style={S.tripsNum}>{trip?.total_trips ?? "0"}</Text>
                   <Text style={S.tripsLbl}>trips</Text>
                 </View>
               </View>
@@ -195,7 +205,7 @@ export default function TripScreen() {
                 <Text style={{ color: THEME.slate400, fontSize: 13 }}>No stops found</Text>
               )}
               {stops.map((stop, i) => {
-                const isDone    = stop.status === "completed";
+                const isDone    = stop.status === "confirmed";
                 const isArrived = stop.status === "arrived";
 
                 return (
@@ -216,7 +226,7 @@ export default function TripScreen() {
                     {/* Info */}
                     <View style={S.stopInfo}>
                       <Text style={S.stopName} numberOfLines={1}>{stop.name}</Text>
-                      <Text style={S.stopAddr} numberOfLines={1}>{stop.address}</Text>
+                      <Text style={S.stopAddr}>{stop.address}</Text>
                       {stop.etaTime !== "—" && (
                         <Text style={S.stopEta}>ETA {stop.etaTime}</Text>
                       )}
@@ -233,7 +243,7 @@ export default function TripScreen() {
                             S.stopStatusTxt,
                             { color: isDone ? THEME.green700 : isArrived ? "#92400e" : THEME.slate600 },
                           ]}>
-                            {isDone ? "Delivered" : isArrived ? "Arrived" : "Pending"}
+                            {isDone ? "Confirmed" : isArrived ? "Arrived" : "Pending"}
                           </Text>
                         </View>
 
@@ -248,7 +258,7 @@ export default function TripScreen() {
                         )}
 
                         {/* Confirm delivery (when arrived / near) */}
-                        {(isArrived || (!isDone && isOnTrip)) && (
+                        {(isArrived && !isDone && isOnTrip) && (
                           <TouchableOpacity
                             style={[S.confirmBtn, confirming && { opacity: 0.6 }]}
                             onPress={() => handleConfirmStop(stop)}

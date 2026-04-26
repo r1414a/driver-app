@@ -50,6 +50,9 @@ export default function AlertsScreen() {
   const insets   = useSafeAreaInsets();
   const dispatch = useDispatch();
   const alerts   = useSelector((s) => s.trip.alerts);
+
+  // console.log("DJFKJDFKJDKJFDKJFD",alerts);
+  
   const unread   = alerts.filter((a) => a.unread).length;
 
   // Mark all as read when tab opens

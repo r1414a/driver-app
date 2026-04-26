@@ -29,7 +29,7 @@ export default function ReportScreen() {
   const [submitted, setSubmitted]     = useState(false);
   const [refId, setRefId]             = useState("");
  
-  const [reportIssue, { isLoading }] = useReportIssueMutation();
+  // const [reportIssue, { isLoading }] = useReportIssueMutation();
  
   const { control, handleSubmit, setValue, reset, formState: { errors } } = useForm({
     resolver: zodResolver(reportSchema),
@@ -60,7 +60,7 @@ export default function ReportScreen() {
  
   return (
     <View style={[S.root, { paddingTop: insets.top }]}>
-      // HEADER
+      {/* // HEADER */}
       <View style={S.header}>
         <Text style={S.headerTitle}>{s.report_title}</Text>
         {trip && (
@@ -89,7 +89,7 @@ export default function ReportScreen() {
           <>
             <Text style={S.sectionTitle}>What's the issue?</Text>
  
-            // ISSUE TYPE GRID
+            {/* // ISSUE TYPE GRID */}
             <View style={S.issueGrid}>
               {s.issue_types.map((label, i) => (
                 <TouchableOpacity
@@ -116,7 +116,7 @@ export default function ReportScreen() {
               <Text style={S.errTxt}>{errors.issue_type.message}</Text>
             )}
  
-            // NOTES INPUT
+            {/* // NOTES INPUT */}
             {selectedIdx !== null && (
               <View style={{ marginTop: 8 }}>
                 <Text style={S.sectionTitle}>Additional details</Text>
@@ -139,7 +139,7 @@ export default function ReportScreen() {
               </View>
             )}
  
-            // TRIP CONTEXT
+            {/* // TRIP CONTEXT */}
             {trip && (
               <View style={S.contextCard}>
                 <Text style={S.contextLabel}>This report will be attached to</Text>
@@ -147,17 +147,19 @@ export default function ReportScreen() {
               </View>
             )}
  
-            // SUBMIT
+            {/* // SUBMIT */}
             <TouchableOpacity
-              style={[S.submitBtn, (selectedIdx === null || isLoading) && S.submitBtnOff]}
+              // style={[S.submitBtn, (selectedIdx === null || isLoading) && S.submitBtnOff]}
+              style={[S.submitBtn]}
               onPress={handleSubmit(onSubmit)}
-              disabled={selectedIdx === null || isLoading}
+              // disabled={selectedIdx === null || isLoading}
               activeOpacity={0.88}
             >
-              {isLoading
-                ? <ActivityIndicator color={THEME.white} />
-                : <Text style={S.submitBtnTxt}>{s.submit_report}</Text>
-              }
+              {/* {isLoading
+                ? <ActivityIndicator color={THEME.white} /> */}
+                {/* :  */}
+                <Text style={S.submitBtnTxt}>{s.submit_report}</Text>
+              {/* } */}
             </TouchableOpacity>
           </>
         )}

@@ -33,6 +33,7 @@
         "android.permission.ACCESS_FINE_LOCATION"
       ],
       "edgeToEdgeEnabled": true,
+      "enableNewArchitecture": true,
       "package": "com.rupesh14a.fleetdriver"
     },
     "web": {
@@ -50,7 +51,7 @@
         "@rnmapbox/maps",
         {
           "RNMapboxMapsImpl": "mapbox",
-          "RNMAPBOX_MAPS_DOWNLOAD_TOKEN": ""
+          "RNMAPBOX_MAPS_DOWNLOAD_TOKEN": "secret"
         }
       ],
       "expo-secure-store"
@@ -58,8 +59,9 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "268191a9-f81d-4a53-8859-7f3cb4e003c3"
+        "projectId": "a9874b1f-091e-46c0-9eb1-ae6cfce8af99"
       }
-    }
+    },
+    "owner": "rupesh0707a"
   }
 }
